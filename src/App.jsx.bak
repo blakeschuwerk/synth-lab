@@ -1,0 +1,99 @@
+import React, { useState, useEffect, useRef } from 'react';
+
+function App() {
+  const [status, setStatus] = useState('💤 Idle');
+  const [isLoaded, setIsLoaded] = useState(false);
+  const audioContext = useRef(null);
+
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = import.meta.env.BASE_URL + "audio-engine/wasm_engine.js"; 
+    script.async = true;
+
+    window.Module = {
+      onRuntimeInitialized: () => {
+        setStatus('✅ Twin Engines Ready');
+        setIsLoaded(true);
+      },
+      print: (text) => console.log("[C++]: " + text),
+      printErr: (text) => console.error("[C++ Err]: " + text)
+    };
+
+    document.body.appendChild(script);
+    return () => { document.body.removeChild(script); };
+  }, []);
+
+  const startAudio = async () => {
+    if (!isLoaded) return;
+    try {
+      if (!audioContext.current) {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioContext.current.state === 'suspended') {
+        await audioContext.current.resume();
+      }
+      setStatus('🔊 Audio Running');
+    } catch (e) {
+      setStatus('❌ Error: ' + e.message);
+    }
+  };
+
+  const playNote = (note) => {
+    if(!isLoaded) return;
+    try {
+        window.Module.ccall('playNote', null, ['number'], [note]);
+        setStatus('🎵 Note On: ' + note);
+    } catch(e) { console.error(e); }
+  };
+
+  const stopNote = (note) => {
+    if(!isLoaded) return;
+    try {
+        window.Module.ccall('stopNote', null, ['number'], [note]);
+        setStatus('🤫 Note Off: ' + note);
+    } catch(e) { console.error(e); }
+  };
+
+  return (
+    <div style={{ padding: '20px', fontFamily: 'sans-serif', textAlign: 'center', color: '#fff', background: '#111', minHeight: '100vh' }}>
+      <h1>🎛️ 5 Aces: Twin Engines</h1>
+      
+      <div style={{ padding: '10px', background: '#222', margin: '20px auto', borderRadius: '8px', maxWidth: '400px', border: '1px solid #444' }}>
+        <h3>{status}</h3>
+      </div>
+
+      <button 
+        onClick={startAudio}
+        style={{
+          padding: '15px 40px', fontSize: '18px', cursor: 'pointer', marginBottom: '30px',
+          backgroundColor: '#007bff', color: 'white', border: 'none', borderRadius: '8px'
+        }}
+      >
+        Start Audio Context
+      </button>
+
+      <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
+        {[60, 62, 64, 65, 67, 69, 71, 72].map((note, i) => (
+            <button
+                key={note}
+                onMouseDown={() => playNote(note)}
+                onMouseUp={() => stopNote(note)}
+                onMouseLeave={() => stopNote(note)}
+                onTouchStart={() => playNote(note)}
+                onTouchEnd={() => stopNote(note)}
+                style={{
+                    width: '60px', height: '200px', 
+                    background: i % 2 === 0 ? '#fff' : '#eee',
+                    color: '#000', border: '1px solid #ccc',
+                    borderRadius: '0 0 5px 5px', cursor: 'pointer',
+                    fontWeight: 'bold', fontSize: '18px'
+                }}
+            >
+                {note}
+            </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+export default App;
