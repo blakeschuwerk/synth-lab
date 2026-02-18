@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState } from './audio/AudioEngine';
+import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState, resumeAudioContext } from './audio/AudioEngine';
 
 /** 'Delay Time' -> 'delayTime', 'Env Amt' -> 'envAmt' */
 function toCamelCase(str) {
@@ -11,7 +11,17 @@ function toCamelCase(str) {
     .join('');
 }
 
-// Calculate frequency from note name and octave
+// Calculate frequency from absolute key index (0-17 for C to High F, ~1.5 octaves)
+// octave: the current octave state (defaults to 4)
+function getFrequencyFromIndex(absoluteIndex, octave = 4) {
+  // Base is C3 = MIDI note 48
+  // When octave=4, we want C4 (MIDI 60), so add (octave - 3) * 12 semitones
+  const semitoneOffset = (octave - 3) * 12;
+  const midiNote = 48 + absoluteIndex + semitoneOffset;
+  return 440 * Math.pow(2, (midiNote - 69) / 12);
+}
+
+// Calculate frequency from note name and octave (legacy support)
 function getFrequency(noteName, octave) {
   const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   const noteIndex = noteNames.indexOf(noteName);
@@ -19,24 +29,30 @@ function getFrequency(noteName, octave) {
   return 440 * Math.pow(2, (midiNote - 69) / 12);
 }
 
-// Piano key layout: White keys A-L, Black keys W,E,T,Y,U,O,P
+// Piano key layout: 18 keys (C to High F) - Home Row Extended
+// White keys: A, S, D, F, G, H, J, K, L, ;, ' (11 keys)
+// Black keys: W, E, T, Y, U, O, P, [ (8 keys)
 const PIANO_KEYS = [
-  { note: 'C', key: 'a', isBlack: false, whiteKeyIndex: 0 },
-  { note: 'C#', key: 'w', isBlack: true, whiteKeyIndex: 0 },
-  { note: 'D', key: 's', isBlack: false, whiteKeyIndex: 1 },
-  { note: 'D#', key: 'e', isBlack: true, whiteKeyIndex: 1 },
-  { note: 'E', key: 'd', isBlack: false, whiteKeyIndex: 2 },
-  { note: 'F', key: 'f', isBlack: false, whiteKeyIndex: 3 },
-  { note: 'F#', key: 't', isBlack: true, whiteKeyIndex: 3 },
-  { note: 'G', key: 'g', isBlack: false, whiteKeyIndex: 4 },
-  { note: 'G#', key: 'y', isBlack: true, whiteKeyIndex: 4 },
-  { note: 'A', key: 'h', isBlack: false, whiteKeyIndex: 5 },
-  { note: 'A#', key: 'u', isBlack: true, whiteKeyIndex: 5 },
-  { note: 'B', key: 'j', isBlack: false, whiteKeyIndex: 6 },
-  { note: 'C', key: 'k', isBlack: false, whiteKeyIndex: 7 },
-  { note: 'C#', key: 'o', isBlack: true, whiteKeyIndex: 7 },
-  { note: 'D', key: 'l', isBlack: false, whiteKeyIndex: 8 },
-  { note: 'D#', key: 'p', isBlack: true, whiteKeyIndex: 8 },
+  // First octave (C3 to B3)
+  { note: 'C', key: 'a', isBlack: false, whiteKeyIndex: 0, absoluteIndex: 0 },
+  { note: 'C#', key: 'w', isBlack: true, whiteKeyIndex: 0, absoluteIndex: 1 },
+  { note: 'D', key: 's', isBlack: false, whiteKeyIndex: 1, absoluteIndex: 2 },
+  { note: 'D#', key: 'e', isBlack: true, whiteKeyIndex: 1, absoluteIndex: 3 },
+  { note: 'E', key: 'd', isBlack: false, whiteKeyIndex: 2, absoluteIndex: 4 },
+  { note: 'F', key: 'f', isBlack: false, whiteKeyIndex: 3, absoluteIndex: 5 },
+  { note: 'F#', key: 't', isBlack: true, whiteKeyIndex: 3, absoluteIndex: 6 },
+  { note: 'G', key: 'g', isBlack: false, whiteKeyIndex: 4, absoluteIndex: 7 },
+  { note: 'G#', key: 'y', isBlack: true, whiteKeyIndex: 4, absoluteIndex: 8 },
+  { note: 'A', key: 'h', isBlack: false, whiteKeyIndex: 5, absoluteIndex: 9 },
+  { note: 'A#', key: 'u', isBlack: true, whiteKeyIndex: 5, absoluteIndex: 10 },
+  { note: 'B', key: 'j', isBlack: false, whiteKeyIndex: 6, absoluteIndex: 11 },
+  // Second octave (C4 to F4)
+  { note: 'C', key: 'k', isBlack: false, whiteKeyIndex: 7, absoluteIndex: 12 },
+  { note: 'C#', key: 'o', isBlack: true, whiteKeyIndex: 7, absoluteIndex: 13 },
+  { note: 'D', key: 'l', isBlack: false, whiteKeyIndex: 8, absoluteIndex: 14 },
+  { note: 'D#', key: 'p', isBlack: true, whiteKeyIndex: 8, absoluteIndex: 15 },
+  { note: 'E', key: ';', isBlack: false, whiteKeyIndex: 9, absoluteIndex: 16 },
+  { note: 'F', key: "'", isBlack: false, whiteKeyIndex: 10, absoluteIndex: 17 },
 ];
 
 const KEY_TO_NOTE = {};
@@ -45,6 +61,32 @@ PIANO_KEYS.forEach(keyInfo => {
 });
 
 const WAVEFORMS = ['sine', 'triangle', 'square', 'saw'];
+
+const DiagnosticProbe = ({ audioPlaying, analyzer, width, height }) => (
+  <div style={{
+    position: 'absolute',
+    top: '2px',
+    left: '2px',
+    maxWidth: '90%',
+    maxHeight: '90%',
+    fontFamily: 'monospace',
+    fontSize: '9px',
+    lineHeight: '1.1',
+    padding: '4px',
+    backgroundColor: 'rgba(215, 44, 44, 0.8)',
+    border: '1px solid rgba(255, 255, 255, 0.4)',
+    borderRadius: '8px',
+    boxShadow: '0 4px 15px rgba(0,0,0,0.3)',
+    color: 'white',
+    zIndex: 9999,
+    pointerEvents: 'none',
+  }}>
+    <strong style={{ margin: 0 }}>TOP WINDOW</strong><br />
+    Audio: {audioPlaying ? '✓ RUNNING' : 'x STOPPED'}<br />
+    Analyzer: {analyzer ? '✓ READY' : 'x MISSING'}<br />
+    Size: ✓ {width}x{height}
+  </div>
+);
 
 // Top-view spectrum analyzer: simplified bars only (no labels), fits small OSC A window.
 // Reads from same analyserRef as SpectrumLab; stays active as long as isAudioPlaying (including release).
@@ -243,8 +285,11 @@ export default function TestSynth() {
   const [selectedOscillator, setSelectedOscillator] = useState(1);
   const [visualState, setVisualState] = useState({ active: [], held: [] });
   const [padPressed, setPadPressed] = useState({ osc1: false, osc2: false, mode: false });
+  const [visorSize, setVisorSize] = useState({ width: 0, height: 0 });
+  const [selectedScale, setSelectedScale] = useState('');
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
+  const visorDisplayRef = useRef(null);
   const sustainRef = useRef(false);
   const knobDragStartY = useRef(0);
   const knobDragStartValue = useRef(0);
@@ -293,6 +338,26 @@ export default function TestSynth() {
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
   }, []);
+
+  // Measure top visor size for diagnostic box
+  useEffect(() => {
+    const el = visorDisplayRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0]?.contentRect ?? { width: 0, height: 0 };
+      setVisorSize({ width: Math.round(width), height: Math.round(height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [analyserReady]);
+
+  // Auto-fix: if keys are pressed but audio is reported stopped (e.g. after refresh), resume context
+  useEffect(() => {
+    const keysPressed = pressedKeys.size > 0 || activeNotes.size > 0;
+    if (!isAudioPlaying && keysPressed) {
+      resumeAudioContext();
+    }
+  }, [isAudioPlaying, pressedKeys.size, activeNotes.size]);
 
   // Console intercept: Capture all console.log/warn/error and display in overlay
   useEffect(() => {
@@ -396,32 +461,32 @@ export default function TestSynth() {
     initialize();
   }, []);
 
-  // Check audio level continuously for sustain detection (volume > 0)
-  // Keeps both top and bottom visualizers active as long as sound is audible (including sustain/release)
+  // Indestructible volume loop: starts on mount, ALWAYS schedules next frame outside the analyser check.
+  // After refresh the loop never stopped, so isAudioPlaying flips to TRUE as soon as a note is played and the Red Diagnostic Box shows RUNNING.
   useEffect(() => {
-    if (!analyserReady || !analyserRef.current) return;
-
-    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    const dataArray = new Uint8Array(2048); // Safe size for typical analyser frequencyBinCount (e.g. 1024)
     let animationFrameId;
 
-    const checkAudioLevel = () => {
+    const check = () => {
       if (analyserRef.current) {
-        analyserRef.current.getByteFrequencyData(dataArray);
-        const maxLevel = Math.max(...dataArray);
-        const threshold = 1; // Volume > 0: keep visualizer active while sound is audible (avoids noise flicker)
-        setIsAudioPlaying(maxLevel > threshold);
+        try {
+          analyserRef.current.getByteFrequencyData(dataArray);
+          const sum = dataArray.reduce((a, b) => a + b, 0);
+          setIsAudioPlaying(sum > 0);
+        } catch (_) {
+          // e.g. context suspended — loop keeps running and will see data once resumed
+        }
       }
-      animationFrameId = requestAnimationFrame(checkAudioLevel);
+      // ALWAYS request the next frame, even if analyzer is null (indestructible on refresh)
+      animationFrameId = requestAnimationFrame(check);
     };
 
-    checkAudioLevel();
+    check();
 
     return () => {
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
-  }, [analyserReady]);
+  }, []);
 
   // Global drag end handler to reset drag state
   useEffect(() => {
@@ -489,8 +554,9 @@ export default function TestSynth() {
       if (KEY_TO_NOTE[key] && !pressedKeys.has(key)) {
         e.preventDefault();
         
+        const keyInfo = PIANO_KEYS.find(k => k.key === key);
         const noteName = KEY_TO_NOTE[key];
-        let frequency = getFrequency(noteName, octave);
+        let frequency = keyInfo ? getFrequencyFromIndex(keyInfo.absoluteIndex, octave) : getFrequency(noteName, octave);
         
         // Apply pitch bend
         if (pitchBend !== 0) {
@@ -575,6 +641,43 @@ export default function TestSynth() {
   }, [waveform, velocity, activeNotes]);
 
   const getNoteDisplay = (noteName) => `${noteName}${octave}`;
+
+  // Scale intervals
+  const SCALE_INTERVALS = {
+    Major: [0, 2, 4, 5, 7, 9, 11],
+    Minor: [0, 2, 3, 5, 7, 8, 10],
+  };
+
+  // Helper function to check if a note is in the scale
+  const getScaleNoteStatus = (noteName) => {
+    if (!selectedScale) return null;
+    
+    // Parse the selected scale string (e.g., 'C Major' or 'F# Minor')
+    const parts = selectedScale.split(' ');
+    if (parts.length !== 2) return null;
+    
+    const scaleRoot = parts[0];
+    const scaleType = parts[1];
+    
+    const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    const rootIndex = noteNames.indexOf(scaleRoot);
+    if (rootIndex === -1) return null;
+    
+    const noteIndex = noteNames.indexOf(noteName);
+    if (noteIndex === -1) return null;
+    
+    // Calculate semitone distance from root (handling octave wrap)
+    const semitoneDistance = (noteIndex - rootIndex + 12) % 12;
+    
+    // Check if it's the root
+    if (semitoneDistance === 0) return 'root';
+    
+    // Check if it's in the scale
+    const intervals = SCALE_INTERVALS[scaleType] || SCALE_INTERVALS.Major;
+    if (intervals.includes(semitoneDistance)) return 'scale';
+    
+    return null;
+  };
 
   // Calculate used effects for single-instance rule
   const usedEffects = assignedSlots.filter(slot => slot !== null);
@@ -693,8 +796,9 @@ export default function TestSynth() {
   // Styles object
   const styles = {
     container: {
-      width: '600px',
-      margin: '20px auto',
+      width: '100%',
+      maxWidth: '720px',
+      margin: '0 auto',
       background: '#2b2b2b',
       borderRadius: '8px',
       paddingTop: '0',
@@ -847,6 +951,8 @@ export default function TestSynth() {
       justifyContent: 'center',
       flex: 1,
       marginTop: '8px',
+      position: 'relative',
+      minHeight: '50px',
     },
     visorArrow: {
       background: 'transparent',
@@ -999,7 +1105,8 @@ export default function TestSynth() {
       flex: 1,
     },
     whiteKey: {
-      width: '32px',
+      flex: 1,
+      minWidth: 0,
       height: '120px',
       background: '#fff',
       borderWidth: '1px',
@@ -1018,6 +1125,7 @@ export default function TestSynth() {
       zIndex: 5,
     },
     whiteKeyHeld: {
+      position: 'relative',
       background: '#007aff',
       borderColor: '#0051d5',
       boxShadow: '0 0 12px rgba(0, 122, 255, 0.8)',
@@ -1026,6 +1134,7 @@ export default function TestSynth() {
       transform: 'translateY(2px)',
     },
     whiteKeyLatched: {
+      position: 'relative',
       background: '#00e5ff',
       borderColor: 'rgba(0, 229, 255, 0.8)',
       boxShadow: '0 0 8px rgba(0, 229, 255, 0.5)',
@@ -1062,6 +1171,7 @@ export default function TestSynth() {
       boxShadow: '0 0 12px rgba(0, 122, 255, 0.8)',
     },
     blackKeyHeld: {
+      position: 'absolute',
       background: '#007aff',
       borderColor: '#0051d5',
       boxShadow: '0 0 12px rgba(0, 122, 255, 0.8)',
@@ -1069,6 +1179,7 @@ export default function TestSynth() {
       transform: 'translateY(2px)',
     },
     blackKeyLatched: {
+      position: 'absolute',
       background: '#00e5ff',
       borderColor: 'rgba(0, 229, 255, 0.8)',
       boxShadow: '0 0 8px rgba(0, 229, 255, 0.5)',
@@ -1263,7 +1374,9 @@ export default function TestSynth() {
 
   // Calculate black key positions
   const getBlackKeyLeft = (whiteKeyIndex) => {
-    return whiteKeyIndex * 32 + 18; // Center black key between white keys
+    // Calculate percentage position: each white key is 1/11 of the container width (11 white keys)
+    const whiteKeyWidthPercent = 100 / 11; // ~9.09% per white key
+    return `${whiteKeyIndex * whiteKeyWidthPercent + whiteKeyWidthPercent * 0.6}%`;
   };
 
   return (
@@ -1428,6 +1541,66 @@ export default function TestSynth() {
           >
             {isPoly ? 'POLY' : 'MONO'}
           </button>
+          
+          {/* Scale Selector */}
+          <select
+            value={selectedScale}
+            onChange={(e) => {
+              setSelectedScale(e.target.value);
+              e.target.blur(); // Release focus immediately after selection
+            }}
+            onKeyDown={(e) => {
+              // Prevent keyboard navigation through dropdown (except Escape/Enter)
+              // This prevents accidental scale switching when user intends to play notes
+              if (e.key !== 'Escape' && e.key !== 'Enter' && e.key !== 'Tab') {
+                e.stopPropagation();
+                // Blur immediately to return focus to window
+                if (e.key.length === 1 || e.key.startsWith('Arrow')) {
+                  e.target.blur();
+                }
+              }
+            }}
+            style={{
+              backgroundColor: '#333',
+              color: '#fff',
+              border: '1px solid #555',
+              borderRadius: '6px',
+              padding: '0px 2px',
+              fontSize: '11px',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              width: '80px',
+              marginLeft: '12px',
+            }}
+          >
+            <option value="">- Key -</option>
+            {/* Major Keys */}
+            <option value="C Major">C Major</option>
+            <option value="C# Major">C# Major</option>
+            <option value="D Major">D Major</option>
+            <option value="D# Major">D# Major</option>
+            <option value="E Major">E Major</option>
+            <option value="F Major">F Major</option>
+            <option value="F# Major">F# Major</option>
+            <option value="G Major">G Major</option>
+            <option value="G# Major">G# Major</option>
+            <option value="A Major">A Major</option>
+            <option value="A# Major">A# Major</option>
+            <option value="B Major">B Major</option>
+            {/* Minor Keys */}
+            <option value="C Minor">C Minor</option>
+            <option value="C# Minor">C# Minor</option>
+            <option value="D Minor">D Minor</option>
+            <option value="D# Minor">D# Minor</option>
+            <option value="E Minor">E Minor</option>
+            <option value="F Minor">F Minor</option>
+            <option value="F# Minor">F# Minor</option>
+            <option value="G Minor">G Minor</option>
+            <option value="G# Minor">G# Minor</option>
+            <option value="A Minor">A Minor</option>
+            <option value="A# Minor">A# Minor</option>
+            <option value="B Minor">B Minor</option>
+          </select>
         </div>
 
         {/* Oscillator Visor */}
@@ -1456,12 +1629,29 @@ export default function TestSynth() {
           >
             ‹
           </button>
-          <div style={styles.visorDisplay}>
+          <div
+            ref={visorDisplayRef}
+            style={styles.visorDisplay}
+            onClick={() => {
+              if (!isAudioPlaying || window.globalAudioContext?.state === 'suspended') {
+                resumeAudioContext();
+                if (window.globalAnalyser) analyserRef.current = window.globalAnalyser;
+              }
+            }}
+          >
             {/* Restored dual-view: when playing, show dancing bars; else static waveform. Stays inside vertical flex / squeezed layout. */}
             {isAudioPlaying && analyserRef.current
               ? <SpectrumAnalyzer analyzer={analyserRef.current} />
               : getWaveformSVG(waveform)
             }
+            {showDebug && (
+              <DiagnosticProbe
+                audioPlaying={isAudioPlaying}
+                analyzer={analyserRef.current}
+                width={visorSize.width}
+                height={visorSize.height}
+              />
+            )}
           </div>
           <button
             style={styles.visorArrow}
@@ -1524,8 +1714,7 @@ export default function TestSynth() {
           {/* White Keys */}
           {PIANO_KEYS.filter(k => !k.isBlack).map((keyInfo, index, arr) => {
             const isHeld = pressedKeys.has(keyInfo.key);
-            const noteName = KEY_TO_NOTE[keyInfo.key];
-            let keyFreq = getFrequency(noteName, octave);
+            let keyFreq = getFrequencyFromIndex(keyInfo.absoluteIndex, octave);
             if (pitchBend !== 0) keyFreq = keyFreq * Math.pow(2, pitchBend / 12);
             const isSounding = visualState.active.some((f) => Math.abs(f - keyFreq) < 1);
             const isLatched = isSounding && !isHeld;
@@ -1542,7 +1731,7 @@ export default function TestSynth() {
                 onMouseDown={() => {
                   if (!pressedKeys.has(keyInfo.key)) {
                     const noteName = KEY_TO_NOTE[keyInfo.key];
-                    let frequency = getFrequency(noteName, octave);
+                    let frequency = getFrequencyFromIndex(keyInfo.absoluteIndex, octave);
                     if (pitchBend !== 0) {
                       frequency = frequency * Math.pow(2, pitchBend / 12);
                     }
@@ -1600,6 +1789,63 @@ export default function TestSynth() {
                 }}>
                   {keyInfo.key.toUpperCase()}
                 </div>
+                {/* Octave label for C keys */}
+                {keyInfo.note === 'C' && (
+                  <div style={{
+                    position: 'absolute',
+                    bottom: '22%',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    fontFamily: 'monospace',
+                    fontSize: '10px',
+                    color: 'rgba(80, 80, 80, 0.7)',
+                    textShadow: '0px 1px 0px rgba(255,255,255,0.8)',
+                    pointerEvents: 'none',
+                    fontWeight: '500',
+                  }}>
+                    C{octave + Math.floor(keyInfo.absoluteIndex / 12)}
+                  </div>
+                )}
+                {/* Scale indicators */}
+                {(() => {
+                  const scaleStatus = getScaleNoteStatus(keyInfo.note);
+                  if (scaleStatus === 'root') {
+                    return (
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '4px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        color: '#FFD700',
+                        fontSize: '30px',
+                        opacity: 1.0,
+                        pointerEvents: 'none',
+                        fontWeight: 'bold',
+                        zIndex: 20,
+                      }}>
+                        *
+                      </div>
+                    );
+                  } else if (scaleStatus === 'scale') {
+                    return (
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '4px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        color: '#2196F3',
+                        fontSize: '24px',
+                        opacity: 0.8,
+                        pointerEvents: 'none',
+                        fontWeight: 'bold',
+                        zIndex: 20,
+                      }}>
+                        •
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             );
           })}
@@ -1607,8 +1853,7 @@ export default function TestSynth() {
           {/* Black Keys */}
           {PIANO_KEYS.filter(k => k.isBlack).map((keyInfo) => {
             const isHeld = pressedKeys.has(keyInfo.key);
-            const noteName = KEY_TO_NOTE[keyInfo.key];
-            let keyFreq = getFrequency(noteName, octave);
+            let keyFreq = getFrequencyFromIndex(keyInfo.absoluteIndex, octave);
             if (pitchBend !== 0) keyFreq = keyFreq * Math.pow(2, pitchBend / 12);
             const isSounding = visualState.active.some((f) => Math.abs(f - keyFreq) < 1);
             const isLatched = isSounding && !isHeld;
@@ -1618,14 +1863,14 @@ export default function TestSynth() {
                 key={`black-${keyInfo.key}`}
                 style={{
                   ...styles.blackKey,
-                  left: `${leftPos}px`,
+                  left: leftPos,
                   ...(isHeld ? styles.blackKeyHeld : isLatched ? styles.blackKeyLatched : {}),
                   ...(isExpanded ? { height: '52px' } : {}),
                 }}
                 onMouseDown={() => {
                   if (!pressedKeys.has(keyInfo.key)) {
                     const noteName = KEY_TO_NOTE[keyInfo.key];
-                    let frequency = getFrequency(noteName, octave);
+                    let frequency = getFrequencyFromIndex(keyInfo.absoluteIndex, octave);
                     if (pitchBend !== 0) {
                       frequency = frequency * Math.pow(2, pitchBend / 12);
                     }
@@ -1683,6 +1928,46 @@ export default function TestSynth() {
                 }}>
                   {keyInfo.key.toUpperCase()}
                 </div>
+                {/* Scale indicators */}
+                {(() => {
+                  const scaleStatus = getScaleNoteStatus(keyInfo.note);
+                  if (scaleStatus === 'root') {
+                    return (
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '12px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        color: '#FFD700',
+                        fontSize: '30px',
+                        opacity: 1.0,
+                        pointerEvents: 'none',
+                        fontWeight: 'bold',
+                        zIndex: 20,
+                      }}>
+                        *
+                      </div>
+                    );
+                  } else if (scaleStatus === 'scale') {
+                    return (
+                      <div style={{
+                        position: 'absolute',
+                        bottom: '12px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        color: '#2196F3',
+                        fontSize: '24px',
+                        opacity: 0.8,
+                        pointerEvents: 'none',
+                        fontWeight: 'bold',
+                        zIndex: 20,
+                      }}>
+                        •
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             );
           })}

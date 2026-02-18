@@ -88,6 +88,12 @@ export async function initAudio() {
   return { core, analyser };
 }
 
+/** Call from UI when keys are pressed but visualizer is stuck (e.g. after refresh). */
+export function resumeAudioContext() {
+  const ctx = window.globalAudioContext;
+  if (ctx?.state === 'suspended') ctx.resume();
+}
+
 export function playTone(freq = 440, waveform = 'sine', velocity = 0.8) {
   const ctx = window.globalAudioContext;
   if (!ctx || !mixerNode) return;
