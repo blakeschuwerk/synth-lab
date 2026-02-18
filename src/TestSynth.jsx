@@ -287,6 +287,25 @@ export default function TestSynth() {
   const [padPressed, setPadPressed] = useState({ osc1: false, osc2: false, mode: false });
   const [visorSize, setVisorSize] = useState({ width: 0, height: 0 });
   const [selectedScale, setSelectedScale] = useState('');
+  // Transport and Sequencer state
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [bpm, setBpm] = useState(120);
+  const [syncEnabled, setSyncEnabled] = useState(false);
+  const [editLayer, setEditLayer] = useState('synth'); // 'synth' | 'seq'
+  const [sequencerSteps, setSequencerSteps] = useState(() =>
+    Array.from({ length: 16 }, () => ({ active: false, note: null }))
+  ); // 16 steps: { active, note }
+  const [currentStep, setCurrentStep] = useState(-1); // -1 = stopped, 0-15 = current step
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingIndex, setRecordingIndex] = useState(0);
+  const [clearButtonHover, setClearButtonHover] = useState(false);
+  // Sequencer Voice parameters
+  const [seqWave, setSeqWave] = useState('saw'); // 'saw' | 'square'
+  const [seqAttack, setSeqAttack] = useState(0.1); // 0-1
+  const [seqDecay, setSeqDecay] = useState(0.3); // 0-1
+  const [seqSustain, setSeqSustain] = useState(0.7); // 0-1
+  const [seqRelease, setSeqRelease] = useState(0.2); // 0-1
+  const [seqFxSlots, setSeqFxSlots] = useState(Array(4).fill(null)); // 4 effect slots
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
   const visorDisplayRef = useRef(null);
@@ -556,11 +575,23 @@ export default function TestSynth() {
         
         const keyInfo = PIANO_KEYS.find(k => k.key === key);
         const noteName = KEY_TO_NOTE[key];
+        const noteDisplay = getNoteDisplay(noteName); // e.g. 'C4', 'C#3'
         let frequency = keyInfo ? getFrequencyFromIndex(keyInfo.absoluteIndex, octave) : getFrequency(noteName, octave);
         
         // Apply pitch bend
         if (pitchBend !== 0) {
           frequency = frequency * Math.pow(2, pitchBend / 12);
+        }
+        
+        // Smart Step Recording: if recording, write note to current step and advance
+        if (isRecording) {
+          setSequencerSteps(prev => {
+            const next = prev.map((step, i) =>
+              i === recordingIndex ? { active: true, note: noteDisplay } : step
+            );
+            return next;
+          });
+          setRecordingIndex(prev => (prev + 1) % 16);
         }
         
         setPressedKeys(prev => new Set([...prev, key]));
@@ -626,7 +657,7 @@ export default function TestSynth() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [pressedKeys, octave, waveform, velocity, activeNotes, pitchBend]);
+  }, [pressedKeys, octave, waveform, velocity, activeNotes, pitchBend, isRecording, recordingIndex]);
 
   // Update sound when waveform/velocity changes
   useEffect(() => {
@@ -640,7 +671,69 @@ export default function TestSynth() {
     }
   }, [waveform, velocity, activeNotes]);
 
+  // Smart Loop playback: advance currentStep at step interval; reset at loop length
+  useEffect(() => {
+    if (!isPlaying) {
+      setCurrentStep(-1);
+      return;
+    }
+    setCurrentStep(0);
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (!isPlaying || !audioInitialized.current) return;
+    const stepDurationMs = (60 * 1000) / (bpm * 4); // 4 steps per beat
+    const intervalId = setInterval(() => {
+      setCurrentStep(prev => {
+        const next = prev + 1;
+        const len = calculateLoopLength(sequencerStepsRef.current);
+        if (next >= len) return 0;
+        return next;
+      });
+    }, stepDurationMs);
+    return () => clearInterval(intervalId);
+  }, [isPlaying, bpm]);
+
+  // When currentStep changes, play the note for that step (if any)
+  useEffect(() => {
+    if (!isPlaying || currentStep < 0) return;
+    const step = sequencerSteps[currentStep];
+    if (step && step.active && step.note) {
+      const freq = noteStringToFrequency(step.note);
+      if (freq != null) {
+        const stepDurationMs = (60 * 1000) / (bpm * 4);
+        playTone(freq, seqWave === 'saw' ? 'saw' : 'square', velocity / 127);
+        const t = setTimeout(() => stopTone(freq), stepDurationMs * 0.4);
+        return () => clearTimeout(t);
+      }
+    }
+  }, [isPlaying, currentStep, sequencerSteps, bpm, seqWave, velocity]);
+
   const getNoteDisplay = (noteName) => `${noteName}${octave}`;
+
+  // Smart Loop: find last active step index, return length as nearest upper multiple of 4 (4, 8, 12, or 16)
+  const calculateLoopLength = (steps = sequencerSteps) => {
+    let lastActiveIndex = -1;
+    steps.forEach((step, i) => {
+      if (step && step.active) lastActiveIndex = i;
+    });
+    if (lastActiveIndex < 0) return 16;
+    return Math.min(16, Math.ceil((lastActiveIndex + 1) / 4) * 4);
+  };
+
+  const sequencerStepsRef = useRef(sequencerSteps);
+  useEffect(() => {
+    sequencerStepsRef.current = sequencerSteps;
+  }, [sequencerSteps]);
+
+  // Parse stored note string "C4" / "C#4" to frequency
+  const noteStringToFrequency = (noteStr) => {
+    if (!noteStr || typeof noteStr !== 'string') return null;
+    const octave = parseInt(noteStr.slice(-1), 10);
+    const noteName = noteStr.slice(0, -1);
+    if (isNaN(octave) || !noteName) return null;
+    return getFrequency(noteName, octave);
+  };
 
   // Scale intervals
   const SCALE_INTERVALS = {
@@ -725,6 +818,62 @@ export default function TestSynth() {
     );
   };
 
+  // Small Knob Component (30px) for Sequencer ADSR
+  const SmallKnob = ({ value, onChange, label }) => {
+    const size = 30;
+    const center = size / 2;
+    const radius = 10;
+    const startAngleDeg = 135;
+    const endAngleDeg = 405;
+    const totalAngleDeg = 270;
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    const v = clamp(value);
+    const currentAngleDeg = startAngleDeg + v * totalAngleDeg;
+    const sweepDeg = v * totalAngleDeg;
+    const largeArcFlag = sweepDeg >= 180 ? 1 : 0;
+
+    const start = polarToCartesian(center, center, radius, startAngleDeg);
+    const end = polarToCartesian(center, center, radius, currentAngleDeg);
+    const trackEnd = polarToCartesian(center, center, radius, endAngleDeg);
+
+    const trackD = `M ${start.x} ${start.y} A ${radius} ${radius} 0 0 1 ${trackEnd.x} ${trackEnd.y}`;
+    const valueD = `M ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`;
+
+    return (
+      <div style={styles.sequencerSmallKnob}>
+        <div style={styles.sequencerSmallKnobLabel}>{label}</div>
+        <div
+          style={{
+            width: size,
+            height: size,
+            position: 'relative',
+            cursor: 'pointer',
+          }}
+          onMouseDown={(e) => {
+            const startY = e.clientY;
+            const startValue = value;
+            const handleMove = (moveEvent) => {
+              const delta = (startY - moveEvent.clientY) / 150;
+              onChange(Math.max(0, Math.min(1, startValue + delta)));
+            };
+            const handleUp = () => {
+              document.removeEventListener('mousemove', handleMove);
+              document.removeEventListener('mouseup', handleUp);
+            };
+            document.addEventListener('mousemove', handleMove);
+            document.addEventListener('mouseup', handleUp);
+          }}
+        >
+          <svg width={size} height={size} style={{ position: 'absolute', top: 0, left: 0 }} pointerEvents="none">
+            <path d={trackD} fill="none" stroke="#333" strokeWidth={3} strokeLinecap="round" />
+            <path d={valueD} fill="none" stroke="#007aff" strokeWidth={3} strokeLinecap="round" />
+          </svg>
+        </div>
+        <div style={styles.sequencerSmallKnobValue}>{Math.round(v * 100)}</div>
+      </div>
+    );
+  };
+
   // Waveform SVG generator - Fixed for 100x50 viewbox
   const getWaveformSVG = (type) => {
     const width = 100;
@@ -795,10 +944,20 @@ export default function TestSynth() {
 
   // Styles object
   const styles = {
+    studioLayout: {
+      display: 'flex',
+      justifyContent: 'center',
+      gap: '20px',
+      alignItems: 'flex-start',
+      width: '100%',
+      maxWidth: '1200px',
+      margin: '0 auto',
+      padding: '20px',
+    },
     container: {
       width: '100%',
       maxWidth: '720px',
-      margin: '0 auto',
+      margin: '0',
       background: '#2b2b2b',
       borderRadius: '8px',
       paddingTop: '0',
@@ -1205,6 +1364,268 @@ export default function TestSynth() {
       borderTop: '1px solid #1a1a1a',
       borderRadius: '0 0 8px 8px',
     },
+    sequencerSidecar: {
+      width: '380px',
+      background: '#2b2b2b',
+      borderRadius: '8px',
+      padding: '16px',
+      boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '12px',
+    },
+    sequencerMasterLCD: {
+      background: 'radial-gradient(circle, #1a1a1a 0%, #000000 100%)',
+      border: '1px solid #333',
+      borderRadius: '4px',
+      padding: '10px',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: '15px',
+    },
+    sequencerLCDPlayStatus: {
+      cursor: 'pointer',
+      fontFamily: 'monospace',
+      fontSize: '12px',
+      fontWeight: '700',
+      background: 'none',
+      border: 'none',
+      padding: 0,
+      minWidth: '36px',
+    },
+    sequencerLCDBPM: {
+      width: '48px',
+      fontFamily: 'monospace',
+      fontSize: '14px',
+      fontWeight: '600',
+      color: '#0f0',
+      background: 'transparent',
+      border: 'none',
+      textAlign: 'center',
+      outline: 'none',
+      textShadow: '0 0 5px rgba(0, 255, 0, 0.6)',
+    },
+    sequencerLCDWaveform: {
+      width: '80px',
+      height: '30px',
+      background: 'transparent',
+      cursor: 'pointer',
+      overflow: 'hidden',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    sequencerModuleBay: {
+      background: 'rgba(0,0,0,0.3)',
+      borderRadius: '8px',
+      boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.6)',
+      padding: '10px',
+    },
+    sequencerADSRStrip: {
+      display: 'flex',
+      gap: '8px',
+      justifyContent: 'space-around',
+      padding: '8px',
+    },
+    sequencerSmallKnob: {
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: '4px',
+    },
+    sequencerSmallKnobLabel: {
+      fontSize: '8px',
+      color: '#888',
+      textTransform: 'uppercase',
+      fontWeight: '600',
+    },
+    sequencerSmallKnobValue: {
+      fontSize: '9px',
+      color: '#fff',
+      fontFamily: 'monospace',
+    },
+    sequencerFxRack: {
+      padding: '12px',
+    },
+    sequencerFxLabel: {
+      fontSize: '11px',
+      fontWeight: '600',
+      color: '#aaa',
+      marginBottom: '12px',
+      textTransform: 'uppercase',
+      letterSpacing: '0.5px',
+    },
+    sequencerFxSlotsGrid: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(4, 1fr)',
+      gap: '8px',
+      justifyContent: 'center',
+    },
+    sequencerEmptySlot: {
+      width: '60px',
+      height: '60px',
+      position: 'relative',
+      opacity: 0.4,
+      border: '1px dashed #666',
+      borderRadius: '50%',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      margin: '0 auto',
+    },
+    sequencerEmptySlotIndicator: {
+      position: 'absolute',
+      width: '2px',
+      height: '15px',
+      background: '#666',
+      borderRadius: '2px',
+      top: '6px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      opacity: 0.4,
+    },
+    sequencerEmptySlotPlus: {
+      fontSize: '24px',
+      fontWeight: '100',
+      color: '#666',
+      lineHeight: '1',
+      marginBottom: '2px',
+      position: 'relative',
+      zIndex: 2,
+    },
+    sequencerEmptySlotLabel: {
+      fontSize: '7px',
+      color: '#666',
+      textTransform: 'uppercase',
+      letterSpacing: '0.5px',
+      position: 'relative',
+      zIndex: 2,
+    },
+    sequencerVoiceSection: {
+      padding: '12px',
+      background: '#1a1a1a',
+      borderRadius: '6px',
+      border: '1px solid #333',
+    },
+    sequencerVoiceLabel: {
+      fontSize: '11px',
+      fontWeight: '600',
+      color: '#aaa',
+      marginBottom: '12px',
+      textTransform: 'uppercase',
+      letterSpacing: '0.5px',
+    },
+    sequencerKnobsRow: {
+      display: 'flex',
+      gap: '12px',
+      justifyContent: 'space-around',
+    },
+    sequencerKnob: {
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      gap: '6px',
+    },
+    sequencerKnobLabel: {
+      fontSize: '9px',
+      color: '#888',
+      textTransform: 'uppercase',
+    },
+    sequencerKnobValue: {
+      fontSize: '10px',
+      color: '#fff',
+      fontFamily: 'monospace',
+    },
+    sequencerStepRail: {
+      background: 'rgba(0,0,0,0.3)',
+      borderRadius: '8px',
+      boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.6)',
+      padding: '10px',
+    },
+    sequencerStepsGrid: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(8, 1fr)',
+      gridTemplateRows: 'repeat(2, 1fr)',
+      gap: '6px',
+    },
+    sequencerStepButton: {
+      width: '40px',
+      height: '40px',
+      borderRadius: '4px',
+      border: '1px solid #333',
+      borderBottom: '2px solid rgba(0,0,0,0.5)',
+      background: 'linear-gradient(180deg, #333 0%, #222 100%)',
+      cursor: 'pointer',
+      position: 'relative',
+      transition: 'all 0.1s',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontSize: '10px',
+      color: '#666',
+    },
+    sequencerStepButtonDownbeat: {
+      background: 'linear-gradient(180deg, #444 0%, #333 100%)',
+    },
+    sequencerStepButtonActive: {
+      background: '#ff9500',
+      borderColor: '#ff9500',
+      borderBottomColor: '#cc7700',
+      boxShadow: '0 0 8px #ff9900',
+      color: '#fff',
+    },
+    sequencerStepButtonCurrent: {
+      borderColor: '#fff',
+      borderWidth: '2px',
+      boxShadow: '0 0 12px rgba(255, 255, 255, 0.8)',
+    },
+    sequencerStepButtonRecordingCursor: {
+      borderColor: '#f00',
+      borderWidth: '2px',
+      boxShadow: '0 0 8px rgba(255, 0, 0, 0.8)',
+    },
+    sequencerRecButton: {
+      width: '28px',
+      height: '28px',
+      borderRadius: '50%',
+      border: '1px solid #555',
+      background: '#333',
+      color: '#888',
+      cursor: 'pointer',
+      fontSize: '9px',
+      fontWeight: '700',
+      padding: 0,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    sequencerRecButtonActive: {
+      background: '#f00',
+      color: '#fff',
+      borderColor: '#f00',
+    },
+    sequencerRestButton: {
+      padding: '4px 8px',
+      borderRadius: '4px',
+      border: '1px solid #555',
+      background: '#333',
+      color: '#fff',
+      cursor: 'pointer',
+      fontSize: '9px',
+      fontWeight: '600',
+    },
+    sequencerClearButton: {
+      padding: '4px 8px',
+      borderRadius: '4px',
+      border: '1px solid #555',
+      background: '#333',
+      color: '#888',
+      cursor: 'pointer',
+      fontSize: '9px',
+      fontWeight: '600',
+    },
     controlLabel: {
       fontSize: '10px',
       color: '#aaa',
@@ -1434,6 +1855,8 @@ export default function TestSynth() {
         ))}
       </div>
 
+      {/* Studio Layout Wrapper */}
+      <div style={styles.studioLayout}>
       <div
         style={{
           ...styles.container,
@@ -2417,6 +2840,157 @@ export default function TestSynth() {
       </div>
         </div>
     </div>
+
+      {/* Sequencer Sidecar */}
+      <div style={styles.sequencerSidecar}>
+        {/* Master LCD (Transport, BPM, Waveform) */}
+        <div style={styles.sequencerMasterLCD}>
+          <button
+            type="button"
+            style={{
+              ...styles.sequencerLCDPlayStatus,
+              color: isPlaying ? '#0f0' : '#f00',
+              ...(isPlaying ? { textShadow: '0 0 5px rgba(0, 255, 0, 0.6)' } : {}),
+            }}
+            onClick={() => setIsPlaying(!isPlaying)}
+            title={isPlaying ? 'Stop' : 'Play'}
+          >
+            {isPlaying ? 'RUN' : 'STOP'}
+          </button>
+          <button
+            type="button"
+            style={{
+              ...styles.sequencerRecButton,
+              ...(isRecording ? styles.sequencerRecButtonActive : {}),
+            }}
+            onClick={() => {
+              const next = !isRecording;
+              setIsRecording(next);
+              if (next) setRecordingIndex(0); // start at step 1 when turning record on
+            }}
+            title={isRecording ? 'Stop recording' : 'Record steps'}
+          >
+            REC
+          </button>
+          {isRecording && (
+            <button
+              type="button"
+              style={styles.sequencerRestButton}
+              onClick={() => {
+                setSequencerSteps(prev => {
+                  const next = prev.map((step, i) =>
+                    i === recordingIndex ? { active: false, note: null } : step
+                  );
+                  return next;
+                });
+                setRecordingIndex(prev => (prev + 1) % 16);
+              }}
+              title="Insert rest (silence) and advance"
+            >
+              REST
+            </button>
+          )}
+          <button
+            type="button"
+            style={{
+              ...styles.sequencerClearButton,
+              ...(clearButtonHover ? { background: '#522', color: '#f88', borderColor: '#833' } : {}),
+            }}
+            onMouseEnter={() => setClearButtonHover(true)}
+            onMouseLeave={() => setClearButtonHover(false)}
+            onClick={() => {
+              setSequencerSteps(() =>
+                Array.from({ length: 16 }, () => ({ active: false, note: null }))
+              );
+              setRecordingIndex(0);
+            }}
+            title="Clear all steps"
+          >
+            CLR
+          </button>
+          <input
+            type="number"
+            value={bpm}
+            onChange={(e) => setBpm(Math.max(1, Math.min(300, parseInt(e.target.value) || 120)))}
+            style={styles.sequencerLCDBPM}
+            min="1"
+            max="300"
+            title="BPM"
+          />
+          <div
+            style={styles.sequencerLCDWaveform}
+            onClick={() => setSeqWave(seqWave === 'saw' ? 'square' : 'saw')}
+            title={`Waveform: ${seqWave} (click to toggle)`}
+          >
+            {getWaveformSVG(seqWave)}
+          </div>
+        </div>
+
+        {/* Section B: ADSR Strip (Module Bay) */}
+        <div style={styles.sequencerModuleBay}>
+          <div style={styles.sequencerADSRStrip}>
+            <SmallKnob value={seqAttack} onChange={setSeqAttack} label="A" />
+            <SmallKnob value={seqDecay} onChange={setSeqDecay} label="D" />
+            <SmallKnob value={seqSustain} onChange={setSeqSustain} label="S" />
+            <SmallKnob value={seqRelease} onChange={setSeqRelease} label="R" />
+          </div>
+        </div>
+
+        {/* Section C: Effects Rack (Module Bay) */}
+        <div style={styles.sequencerModuleBay}>
+          <div style={styles.sequencerFxRack}>
+            <div style={styles.sequencerFxLabel}>SEQ FX</div>
+            <div style={styles.sequencerFxSlotsGrid}>
+              {seqFxSlots.map((fx, index) => (
+                <div key={index} style={styles.sequencerEmptySlot}>
+                  <div style={styles.sequencerEmptySlotIndicator}></div>
+                  <div style={styles.sequencerEmptySlotPlus}>+</div>
+                  <div style={styles.sequencerEmptySlotLabel}>Empty</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Section D: Step Grid (Rail + Rhythm Guide) */}
+        <div style={styles.sequencerStepRail}>
+          <div style={styles.sequencerStepsGrid}>
+          {sequencerSteps.map((step, index) => {
+            const isActive = step && step.active;
+            const isDownbeat = index % 4 === 0;
+            const isRecordingCursor = isRecording && index === recordingIndex;
+            return (
+              <button
+                key={index}
+                type="button"
+                style={{
+                  ...styles.sequencerStepButton,
+                  ...(!isActive && isDownbeat ? styles.sequencerStepButtonDownbeat : {}),
+                  ...(isActive ? styles.sequencerStepButtonActive : {}),
+                  ...(currentStep === index ? styles.sequencerStepButtonCurrent : {}),
+                  ...(isRecordingCursor ? styles.sequencerStepButtonRecordingCursor : {}),
+                }}
+                onClick={() => {
+                  if (isRecording) {
+                    setRecordingIndex(index); // click-to-set cursor
+                    return;
+                  }
+                  setSequencerSteps(prev =>
+                    prev.map((s, i) =>
+                      i === index ? { active: !s.active, note: null } : s
+                    )
+                  );
+                }}
+                title={step.note ? `Step ${index + 1}: ${step.note}` : `Step ${index + 1}`}
+              >
+                {isActive && step.note ? step.note : index + 1}
+              </button>
+            );
+          })}
+          </div>
+        </div>
+      </div>
+      </div>
 
       {/* Debug Toggle Button */}
       <button
