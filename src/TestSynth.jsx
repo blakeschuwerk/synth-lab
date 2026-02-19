@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState, resumeAudioContext } from './audio/AudioEngine';
+import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState, resumeAudioContext, triggerSequencerStep, updateSeqEffectsChain } from './audio/AudioEngine';
 
 /** 'Delay Time' -> 'delayTime', 'Env Amt' -> 'envAmt' */
 function toCamelCase(str) {
@@ -273,7 +273,10 @@ export default function TestSynth() {
   const [assignedSlots, setAssignedSlots] = useState(Array(8).fill(null)); // 8 slots: 4 left + 4 right
   const [slotValues, setSlotValues] = useState(Array(8).fill(0.5)); // Values for each knob (0-1)
   const [dragOverSlot, setDragOverSlot] = useState(null);
+  const [dragOverSeqSlot, setDragOverSeqSlot] = useState(null);
   const [draggingKnob, setDraggingKnob] = useState(null); // Track which knob is being dragged
+  const [draggingSeqFx, setDraggingSeqFx] = useState(null); // Track which sequencer FX slot is being dragged
+  const [editingSeqFx, setEditingSeqFx] = useState(null); // Track which sequencer FX knob is being edited
   const [editingKnob, setEditingKnob] = useState(null); // Track which knob is being edited
   const [logs, setLogs] = useState([{ message: 'Waiting for input...', type: 'log' }]);
   const [showDebug, setShowDebug] = useState(false);
@@ -293,19 +296,22 @@ export default function TestSynth() {
   const [syncEnabled, setSyncEnabled] = useState(false);
   const [editLayer, setEditLayer] = useState('synth'); // 'synth' | 'seq'
   const [sequencerSteps, setSequencerSteps] = useState(() =>
-    Array.from({ length: 16 }, () => ({ active: false, note: null }))
-  ); // 16 steps: { active, note }
+    Array.from({ length: 16 }, () => ({ active: false, tied: false, note: null }))
+  ); // 16 steps: { active, tied, note }
   const [currentStep, setCurrentStep] = useState(-1); // -1 = stopped, 0-15 = current step
   const [isRecording, setIsRecording] = useState(false);
   const [recordingIndex, setRecordingIndex] = useState(0);
   const [clearButtonHover, setClearButtonHover] = useState(false);
   // Sequencer Voice parameters
   const [seqWave, setSeqWave] = useState('saw'); // 'saw' | 'square'
+  const [seqCutoff, setSeqCutoff] = useState(0.5); // 0-1
+  const [seqRes, setSeqRes] = useState(0.0); // 0-1
   const [seqAttack, setSeqAttack] = useState(0.1); // 0-1
   const [seqDecay, setSeqDecay] = useState(0.3); // 0-1
   const [seqSustain, setSeqSustain] = useState(0.7); // 0-1
   const [seqRelease, setSeqRelease] = useState(0.2); // 0-1
   const [seqFxSlots, setSeqFxSlots] = useState(Array(4).fill(null)); // 4 effect slots
+  const [seqFxValues, setSeqFxValues] = useState(Array(4).fill(0.5)); // Values for sequencer FX slots (0-1)
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
   const visorDisplayRef = useRef(null);
@@ -313,7 +319,9 @@ export default function TestSynth() {
   const knobDragStartY = useRef(0);
   const knobDragStartValue = useRef(0);
   const isDropSuccessful = useRef(false);
+  const isSeqFxDropSuccessful = useRef(false);
   const addLogRef = useRef(null);
+  const seqParamsRef = useRef({ seqAttack, seqDecay, seqSustain, seqRelease });
 
   const addLog = (msg, type = 'log') => {
     setLogs((prev) => [{ message: String(msg), type }, ...prev].slice(0, 100));
@@ -587,7 +595,7 @@ export default function TestSynth() {
         if (isRecording) {
           setSequencerSteps(prev => {
             const next = prev.map((step, i) =>
-              i === recordingIndex ? { active: true, note: noteDisplay } : step
+              i === recordingIndex ? { active: true, tied: false, note: noteDisplay } : step
             );
             return next;
           });
@@ -671,43 +679,75 @@ export default function TestSynth() {
     }
   }, [waveform, velocity, activeNotes]);
 
-  // Smart Loop playback: advance currentStep at step interval; reset at loop length
+  // Lookahead Scheduler: Master Clock for Sequencer Playback
   useEffect(() => {
-    if (!isPlaying) {
+    if (!isPlaying || !audioInitialized.current || !window.globalAudioContext) {
       setCurrentStep(-1);
       return;
     }
-    setCurrentStep(0);
-  }, [isPlaying]);
 
-  useEffect(() => {
-    if (!isPlaying || !audioInitialized.current) return;
-    const stepDurationMs = (60 * 1000) / (bpm * 4); // 4 steps per beat
-    const intervalId = setInterval(() => {
-      setCurrentStep(prev => {
-        const next = prev + 1;
-        const len = calculateLoopLength(sequencerStepsRef.current);
-        if (next >= len) return 0;
-        return next;
-      });
-    }, stepDurationMs);
-    return () => clearInterval(intervalId);
-  }, [isPlaying, bpm]);
+    const ctx = window.globalAudioContext;
+    let timerID;
+    let nextNoteTime = ctx.currentTime + 0.1; // 100ms lookahead
+    let currentStepIndex = 0;
 
-  // When currentStep changes, play the note for that step (if any)
-  useEffect(() => {
-    if (!isPlaying || currentStep < 0) return;
-    const step = sequencerSteps[currentStep];
-    if (step && step.active && step.note) {
-      const freq = noteStringToFrequency(step.note);
-      if (freq != null) {
-        const stepDurationMs = (60 * 1000) / (bpm * 4);
-        playTone(freq, seqWave === 'saw' ? 'saw' : 'square', velocity / 127);
-        const t = setTimeout(() => stopTone(freq), stepDurationMs * 0.4);
-        return () => clearTimeout(t);
+    // Calculate step duration (16th notes: 4 steps per beat)
+    const secondsPerBeat = 60.0 / bpm;
+    const stepDuration = secondsPerBeat / 4;
+
+    // Scheduler function with lookahead
+    const schedule = () => {
+      while (nextNoteTime < ctx.currentTime + 0.1) {
+        // Recalculate loop length dynamically (in case steps changed during playback)
+        const loopLength = calculateLoopLength(sequencerStepsRef.current);
+        
+        // A. Play the Note
+        const step = sequencerStepsRef.current[currentStepIndex];
+        if (step && step.active && step.note) {
+          // Calculate tie states for Legato
+          const isTiedFromPrev = step.tied;
+          let isTiedToNext = false;
+          const nextStepIndex = (currentStepIndex + 1) % loopLength;
+          const nextStep = sequencerStepsRef.current[nextStepIndex];
+          if (nextStep && nextStep.active && nextStep.tied) {
+            isTiedToNext = true;
+          }
+          
+          const p = seqParamsRef.current;
+          triggerSequencerStep(step.note, nextNoteTime, {
+            wave: seqWave,
+            cutoff: seqCutoff,
+            res: seqRes,
+            attack: p.seqAttack * 100, // Convert 0-1 to 0-100 for ADSR formula
+            decay: p.seqDecay * 100,
+            sustain: p.seqSustain * 100,
+            release: p.seqRelease * 100,
+          }, isTiedFromPrev, isTiedToNext, stepDuration);
+        }
+
+        // B. Update UI (throttle updates to avoid React choking)
+        const stepIndexToShow = currentStepIndex;
+        requestAnimationFrame(() => {
+          setCurrentStep(stepIndexToShow);
+        });
+
+        // C. Advance Time & Index
+        nextNoteTime += stepDuration;
+        currentStepIndex = (currentStepIndex + 1) % loopLength;
       }
-    }
-  }, [isPlaying, currentStep, sequencerSteps, bpm, seqWave, velocity]);
+
+      timerID = setTimeout(schedule, 25.0);
+    };
+
+    // Start scheduling
+    schedule();
+
+    // Cleanup
+    return () => {
+      if (timerID) clearTimeout(timerID);
+      setCurrentStep(-1);
+    };
+  }, [isPlaying, bpm, sequencerSteps, seqWave, seqCutoff, seqRes]);
 
   const getNoteDisplay = (noteName) => `${noteName}${octave}`;
 
@@ -725,6 +765,15 @@ export default function TestSynth() {
   useEffect(() => {
     sequencerStepsRef.current = sequencerSteps;
   }, [sequencerSteps]);
+
+  useEffect(() => {
+    seqParamsRef.current = { seqAttack, seqDecay, seqSustain, seqRelease };
+  }, [seqAttack, seqDecay, seqSustain, seqRelease]);
+
+  // Update sequencer FX chain when slots or values change
+  useEffect(() => {
+    updateSeqEffectsChain(seqFxSlots, seqFxValues);
+  }, [seqFxSlots, seqFxValues]);
 
   // Parse stored note string "C4" / "C#4" to frequency
   const noteStringToFrequency = (noteStr) => {
@@ -774,6 +823,9 @@ export default function TestSynth() {
 
   // Calculate used effects for single-instance rule
   const usedEffects = assignedSlots.filter(slot => slot !== null);
+  // Check if effect is used in main synth or sequencer
+  const isEffectInMainSynth = (effectName) => assignedSlots.includes(effectName);
+  const isEffectInSequencer = (effectName) => seqFxSlots.includes(effectName);
 
   // Helper: angle in degrees (0 = 3 o'clock) to SVG x,y
   const polarToCartesian = (cx, cy, radius, angleDeg) => {
@@ -811,6 +863,40 @@ export default function TestSynth() {
         <path d={valueD} fill="none" stroke="#00f0ff" strokeWidth={6} strokeLinecap="round" />
         {isDragging && (
           <text x={center} y={center + 4} textAnchor="middle" fontSize="10" fill="#00f0ff" fontWeight="600">
+            {Math.round(v * 100)}
+          </text>
+        )}
+      </svg>
+    );
+  };
+
+  // Sequencer FX Knob Component (40px) - matches main synth knob but smaller
+  const SequencerFxKnobSVG = ({ value, isDragging }) => {
+    const size = 40;
+    const center = size / 2;
+    const radius = 15;
+    const startAngleDeg = 135;
+    const endAngleDeg = 405;
+    const totalAngleDeg = 270;
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    const v = clamp(value);
+    const currentAngleDeg = startAngleDeg + v * totalAngleDeg;
+    const sweepDeg = v * totalAngleDeg;
+    const largeArcFlag = sweepDeg >= 180 ? 1 : 0;
+
+    const start = polarToCartesian(center, center, radius, startAngleDeg);
+    const end = polarToCartesian(center, center, radius, currentAngleDeg);
+    const trackEnd = polarToCartesian(center, center, radius, endAngleDeg);
+
+    const trackD = `M ${start.x} ${start.y} A ${radius} ${radius} 0 0 1 ${trackEnd.x} ${trackEnd.y}`;
+    const valueD = `M ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`;
+
+    return (
+      <svg width={size} height={size} style={{ position: 'absolute', top: 0, left: 0 }} pointerEvents="none">
+        <path d={trackD} fill="none" stroke="#333" strokeWidth={4} strokeLinecap="round" />
+        <path d={valueD} fill="none" stroke="#00f0ff" strokeWidth={4} strokeLinecap="round" />
+        {isDragging && (
+          <text x={center} y={center + 3} textAnchor="middle" fontSize="8" fill="#00f0ff" fontWeight="600">
             {Math.round(v * 100)}
           </text>
         )}
@@ -875,6 +961,53 @@ export default function TestSynth() {
   };
 
   // Waveform SVG generator - Fixed for 100x50 viewbox
+  // Serum-Style ADSR Visualizer — Shared Source of Truth proportional math (matches AudioEngine)
+  const ADSRVisualizer = ({ attack, decay, sustain, release }) => {
+    // Convert 0-1 to 0-100 for calculations
+    const seqAttack = attack * 100;
+    const seqDecay = decay * 100;
+    const seqSustain = sustain * 100;
+    const seqRelease = release * 100;
+    
+    // X-axis: 80 represents the 80% gate drop (same as audio engine)
+    const attackRatio = seqAttack / 100;
+    const aX = attackRatio * 80;
+
+    const decayRatio = seqDecay / 100;
+    const remainingX = 80 - aX;
+    const dX = aX + (decayRatio * remainingX);
+
+    const sY = 100 - seqSustain;
+    const rX = 80 + ((seqRelease / 100) * 20); // Release tail past the gate
+
+    // Connect the points (viewBox 0 0 100 100)
+    const points = `0,100 ${aX},0 ${dX},${sY} 80,${sY} ${rX},100`;
+    
+    return (
+      <svg
+        width={200}
+        height={80}
+        viewBox="0 0 100 100"
+        style={{
+          background: '#111',
+          borderRadius: '4px',
+          border: '1px solid #333',
+        }}
+      >
+        <line x1="0" y1="50" x2="100" y2="50" stroke="#222" strokeWidth="0.5" strokeDasharray="2,2" />
+        <line x1="80" y1="0" x2="80" y2="100" stroke="#222" strokeWidth="0.5" strokeDasharray="2,2" />
+        <polyline
+          points={points}
+          fill="none"
+          stroke="#00FFFF"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  };
+
   const getWaveformSVG = (type) => {
     const width = 100;
     const height = 50;
@@ -1435,7 +1568,7 @@ export default function TestSynth() {
       gap: '4px',
     },
     sequencerSmallKnobLabel: {
-      fontSize: '8px',
+      fontSize: '10px',
       color: '#888',
       textTransform: 'uppercase',
       fontWeight: '600',
@@ -1576,6 +1709,13 @@ export default function TestSynth() {
       boxShadow: '0 0 8px #ff9900',
       color: '#fff',
     },
+    sequencerStepButtonTied: {
+      background: '#ffeb3b',
+      borderColor: '#ffeb3b',
+      borderBottomColor: '#ccbb00',
+      boxShadow: '0 0 8px #ffeb3b',
+      color: '#000',
+    },
     sequencerStepButtonCurrent: {
       borderColor: '#fff',
       borderWidth: '2px',
@@ -1587,19 +1727,19 @@ export default function TestSynth() {
       boxShadow: '0 0 8px rgba(255, 0, 0, 0.8)',
     },
     sequencerRecButton: {
-      width: '28px',
+      padding: '4px 8px',
       height: '28px',
-      borderRadius: '50%',
+      borderRadius: '4px',
       border: '1px solid #555',
       background: '#333',
       color: '#888',
       cursor: 'pointer',
       fontSize: '9px',
       fontWeight: '700',
-      padding: 0,
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'center',
+      minWidth: '50px',
     },
     sequencerRecButtonActive: {
       background: '#f00',
@@ -1802,7 +1942,7 @@ export default function TestSynth() {
 
   return (
     <React.Fragment>
-      <style dangerouslySetInnerHTML={{ __html: '@keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.9; } }' }} />
+      <style dangerouslySetInnerHTML={{ __html: '@keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.9; } } body, #root { user-select: none; -webkit-user-select: none; }' }} />
       {/* Drawer Overlay */}
       {libraryOpen && (
         <div
@@ -1827,26 +1967,49 @@ export default function TestSynth() {
             <div style={styles.drawerCategoryTitle}>{category}</div>
             <div style={styles.drawerChips}>
               {params.map((param) => {
-                const isUsed = usedEffects.includes(param);
+                const inMainSynth = isEffectInMainSynth(param);
+                const inSequencer = isEffectInSequencer(param);
                 return (
                   <div
                     key={param}
                     style={{
                       ...styles.parameterChip,
-                      ...(hoveredChip === param && !isUsed ? styles.parameterChipHover : {}),
-                      ...(isUsed ? styles.parameterChipDisabled : {}),
+                      ...(hoveredChip === param ? styles.parameterChipHover : {}),
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
                     }}
-                    draggable={!isUsed}
+                    draggable={true}
                     onDragStart={(e) => {
-                      if (!isUsed) {
-                        e.dataTransfer.setData('text/plain', param);
-                        setLibraryOpen(false); // Auto-close drawer when dragging starts
-                      }
+                      e.dataTransfer.setData('text/plain', param);
+                      setLibraryOpen(false); // Auto-close drawer when dragging starts
                     }}
-                    onMouseEnter={() => !isUsed && setHoveredChip(param)}
+                    onMouseEnter={() => setHoveredChip(param)}
                     onMouseLeave={() => setHoveredChip(null)}
                   >
-                    {param}
+                    {/* LED 1: Main Synth Indicator */}
+                    <div
+                      style={{
+                        width: '6px',
+                        height: '6px',
+                        borderRadius: '50%',
+                        backgroundColor: inMainSynth ? '#00aaff' : 'rgba(0, 170, 255, 0.2)',
+                        boxShadow: inMainSynth ? '0 0 5px #00aaff' : 'none',
+                        flexShrink: 0,
+                      }}
+                    />
+                    {/* LED 2: Sequencer Indicator */}
+                    <div
+                      style={{
+                        width: '6px',
+                        height: '6px',
+                        borderRadius: '50%',
+                        backgroundColor: inSequencer ? '#ff9900' : 'rgba(255, 153, 0, 0.2)',
+                        boxShadow: inSequencer ? '0 0 5px #ff9900' : 'none',
+                        flexShrink: 0,
+                      }}
+                    />
+                    <span>{param}</span>
                   </div>
                 );
               })}
@@ -2558,14 +2721,31 @@ export default function TestSynth() {
                       if (draggingKnob === null) {
                         const paramName = e.dataTransfer.getData('text/plain');
                         if (paramName) {
+                          // Smart Move: Find if effect already exists, remove it first
+                          // Compute existing index before state updates to avoid stale closure
+                          const existingIndex = assignedSlots.findIndex(slot => slot === paramName);
+                          const existingValue = existingIndex !== -1 ? slotValues[existingIndex] : 0.5;
+                          
                           setAssignedSlots(prev => {
                             const next = [...prev];
+                            if (existingIndex !== -1 && existingIndex !== slotIndex) {
+                              // Remove from old slot
+                              next[existingIndex] = null;
+                            }
+                            // Place in new slot
                             next[slotIndex] = paramName;
                             return next;
                           });
                           setSlotValues(prev => {
                             const next = [...prev];
-                            next[slotIndex] = 0.5;
+                            if (existingIndex !== -1 && existingIndex !== slotIndex) {
+                              // Move value from old slot
+                              next[slotIndex] = existingValue;
+                              next[existingIndex] = 0.5;
+                            } else {
+                              // New effect, default value
+                              next[slotIndex] = 0.5;
+                            }
                             return next;
                           });
                         }
@@ -2746,14 +2926,31 @@ export default function TestSynth() {
                       if (draggingKnob === null) {
                         const paramName = e.dataTransfer.getData('text/plain');
                         if (paramName) {
+                          // Smart Move: Find if effect already exists, remove it first
                           setAssignedSlots(prev => {
                             const next = [...prev];
+                            // Find existing index of this effect
+                            const existingIndex = next.findIndex(slot => slot === paramName);
+                            if (existingIndex !== -1 && existingIndex !== slotIndex) {
+                              // Remove from old slot
+                              next[existingIndex] = null;
+                            }
+                            // Place in new slot
                             next[slotIndex] = paramName;
                             return next;
                           });
                           setSlotValues(prev => {
                             const next = [...prev];
-                            next[slotIndex] = 0.5;
+                            // Find existing index to preserve its value
+                            const existingIndex = prev.findIndex((val, idx) => assignedSlots[idx] === paramName);
+                            if (existingIndex !== -1 && existingIndex !== slotIndex) {
+                              // Move value from old slot
+                              next[slotIndex] = prev[existingIndex];
+                              next[existingIndex] = 0.5;
+                            } else {
+                              // New effect, default value
+                              next[slotIndex] = 0.5;
+                            }
                             return next;
                           });
                         }
@@ -2869,8 +3066,8 @@ export default function TestSynth() {
               if (next) setRecordingIndex(0); // start at step 1 when turning record on
             }}
             title={isRecording ? 'Stop recording' : 'Record steps'}
-          >
-            REC
+            >
+            RECORD
           </button>
           {isRecording && (
             <button
@@ -2879,7 +3076,7 @@ export default function TestSynth() {
               onClick={() => {
                 setSequencerSteps(prev => {
                   const next = prev.map((step, i) =>
-                    i === recordingIndex ? { active: false, note: null } : step
+                    i === recordingIndex ? { active: false, tied: false, note: null } : step
                   );
                   return next;
                 });
@@ -2900,13 +3097,13 @@ export default function TestSynth() {
             onMouseLeave={() => setClearButtonHover(false)}
             onClick={() => {
               setSequencerSteps(() =>
-                Array.from({ length: 16 }, () => ({ active: false, note: null }))
+                Array.from({ length: 16 }, () => ({ active: false, tied: false, note: null }))
               );
               setRecordingIndex(0);
             }}
             title="Clear all steps"
           >
-            CLR
+            CLEAR
           </button>
           <input
             type="number"
@@ -2917,37 +3114,248 @@ export default function TestSynth() {
             max="300"
             title="BPM"
           />
-          <div
-            style={styles.sequencerLCDWaveform}
+          <button
+            style={{
+              ...styles.sequencerLCDWaveform,
+              cursor: 'pointer',
+            }}
             onClick={() => setSeqWave(seqWave === 'saw' ? 'square' : 'saw')}
             title={`Waveform: ${seqWave} (click to toggle)`}
           >
             {getWaveformSVG(seqWave)}
-          </div>
+          </button>
         </div>
 
-        {/* Section B: ADSR Strip (Module Bay) */}
+        {/* Section B: ADSR Visualizer & Strip (Module Bay) */}
         <div style={styles.sequencerModuleBay}>
+          {/* Serum-Style ADSR Visualizer */}
+          <div style={{ marginBottom: '12px', display: 'flex', justifyContent: 'center' }}>
+            <ADSRVisualizer
+              attack={seqAttack}
+              decay={seqDecay}
+              sustain={seqSustain}
+              release={seqRelease}
+            />
+          </div>
           <div style={styles.sequencerADSRStrip}>
-            <SmallKnob value={seqAttack} onChange={setSeqAttack} label="A" />
-            <SmallKnob value={seqDecay} onChange={setSeqDecay} label="D" />
-            <SmallKnob value={seqSustain} onChange={setSeqSustain} label="S" />
-            <SmallKnob value={seqRelease} onChange={setSeqRelease} label="R" />
+            <SmallKnob value={seqAttack} onChange={setSeqAttack} label="ATTACK" />
+            <SmallKnob value={seqDecay} onChange={setSeqDecay} label="DECAY" />
+            <SmallKnob value={seqSustain} onChange={setSeqSustain} label="SUSTAIN" />
+            <SmallKnob value={seqRelease} onChange={setSeqRelease} label="RELEASE" />
           </div>
         </div>
 
         {/* Section C: Effects Rack (Module Bay) */}
         <div style={styles.sequencerModuleBay}>
           <div style={styles.sequencerFxRack}>
-            <div style={styles.sequencerFxLabel}>SEQ FX</div>
+            <div style={styles.sequencerFxLabel}>SEQUENCER FX</div>
             <div style={styles.sequencerFxSlotsGrid}>
-              {seqFxSlots.map((fx, index) => (
-                <div key={index} style={styles.sequencerEmptySlot}>
-                  <div style={styles.sequencerEmptySlotIndicator}></div>
-                  <div style={styles.sequencerEmptySlotPlus}>+</div>
-                  <div style={styles.sequencerEmptySlotLabel}>Empty</div>
-                </div>
-              ))}
+              {seqFxSlots.map((fx, index) => {
+                const isDragOver = dragOverSeqSlot === index;
+                const assignedFx = seqFxSlots[index];
+                
+                if (assignedFx) {
+                  // Active FX slot with interactive knob
+                  const knobValue = seqFxValues[index];
+                  const isEditing = editingSeqFx === index;
+                  const isDragging = draggingSeqFx === index;
+                  
+                  return (
+                    <div
+                      key={index}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        width: '60px',
+                        userSelect: 'none',
+                        ...(isDragging ? { opacity: 0.4, filter: 'grayscale(100%) brightness(0.7)' } : {}),
+                      }}
+                      onDragOver={(e) => {
+                        if (draggingSeqFx !== null && draggingSeqFx !== index) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDragOverSeqSlot(index);
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        isSeqFxDropSuccessful.current = true;
+                        if (draggingSeqFx !== null && draggingSeqFx !== index) {
+                          const src = draggingSeqFx;
+                          setSeqFxSlots(prev => {
+                            const next = [...prev];
+                            next[index] = next[src];
+                            next[src] = null;
+                            return next;
+                          });
+                          setSeqFxValues(prev => {
+                            const next = [...prev];
+                            next[index] = next[src];
+                            next[src] = 0.5;
+                            return next;
+                          });
+                          setDraggingSeqFx(null);
+                        }
+                        setDragOverSeqSlot(null);
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: '40px',
+                          height: '40px',
+                          position: 'relative',
+                          cursor: 'pointer',
+                        }}
+                        draggable={false}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setEditingSeqFx(index);
+                          knobDragStartY.current = e.clientY;
+                          knobDragStartValue.current = knobValue;
+                          
+                          const handleMouseMove = (moveEvent) => {
+                            const deltaY = knobDragStartY.current - moveEvent.clientY;
+                            const sensitivity = 0.005;
+                            const newValue = Math.max(0, Math.min(1, knobDragStartValue.current + deltaY * sensitivity));
+                            setSeqFxValues(prev => {
+                              const next = [...prev];
+                              next[index] = newValue;
+                              return next;
+                            });
+                          };
+                          
+                          const handleMouseUp = () => {
+                            setEditingSeqFx(null);
+                            document.removeEventListener('mousemove', handleMouseMove);
+                            document.removeEventListener('mouseup', handleMouseUp);
+                          };
+                          
+                          document.addEventListener('mousemove', handleMouseMove);
+                          document.addEventListener('mouseup', handleMouseUp);
+                        }}
+                      >
+                        <SequencerFxKnobSVG value={knobValue} isDragging={isEditing} />
+                      </div>
+                      <div
+                        style={{
+                          fontSize: '7px',
+                          color: '#888',
+                          textAlign: 'center',
+                          marginTop: '4px',
+                          textTransform: 'uppercase',
+                          cursor: 'move',
+                        }}
+                        draggable={true}
+                        onDragStart={(e) => {
+                          isSeqFxDropSuccessful.current = false;
+                          setDraggingSeqFx(index);
+                          e.dataTransfer.effectAllowed = 'move';
+                        }}
+                        onDragEnd={(e) => {
+                          // If drag ended without successful drop, remove the slot
+                          if (!isSeqFxDropSuccessful.current) {
+                            setSeqFxSlots(prev => {
+                              const next = [...prev];
+                              next[index] = null;
+                              return next;
+                            });
+                            setSeqFxValues(prev => {
+                              const next = [...prev];
+                              next[index] = 0.5;
+                              return next;
+                            });
+                          }
+                          setDraggingSeqFx(null);
+                          isSeqFxDropSuccessful.current = false;
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.color = '#888'; }}
+                      >
+                        {assignedFx}
+                      </div>
+                    </div>
+                  );
+                }
+                
+                // Empty slot
+                return (
+                  <div
+                    key={index}
+                    style={{
+                      ...styles.sequencerEmptySlot,
+                      ...(isDragOver ? { opacity: 0.8, border: '1px dashed #fff' } : {}),
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDragOverSeqSlot(index);
+                    }}
+                    onDragLeave={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDragOverSeqSlot(null);
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      isSeqFxDropSuccessful.current = true;
+                      const paramName = e.dataTransfer.getData('text/plain');
+                      if (paramName) {
+                        // Smart Move: Find if effect already exists, remove it first
+                        // Compute existing index before state updates to avoid stale closure
+                        const existingIndex = seqFxSlots.findIndex(slot => slot === paramName);
+                        const existingValue = existingIndex !== -1 ? seqFxValues[existingIndex] : 0.5;
+                        
+                        setSeqFxSlots(prev => {
+                          const next = [...prev];
+                          if (existingIndex !== -1 && existingIndex !== index) {
+                            // Remove from old slot
+                            next[existingIndex] = null;
+                          }
+                          // Place in new slot
+                          next[index] = paramName;
+                          return next;
+                        });
+                        setSeqFxValues(prev => {
+                          const next = [...prev];
+                          if (existingIndex !== -1 && existingIndex !== index) {
+                            // Move value from old slot
+                            next[index] = existingValue;
+                            next[existingIndex] = 0.5;
+                          } else {
+                            // New effect, default value
+                            next[index] = 0.5;
+                          }
+                          return next;
+                        });
+                      } else if (draggingSeqFx !== null) {
+                        const src = draggingSeqFx;
+                        setSeqFxSlots(prev => {
+                          const next = [...prev];
+                          next[index] = next[src];
+                          next[src] = null;
+                          return next;
+                        });
+                        setSeqFxValues(prev => {
+                          const next = [...prev];
+                          next[index] = next[src];
+                          next[src] = 0.5;
+                          return next;
+                        });
+                        setDraggingSeqFx(null);
+                      }
+                      setDragOverSeqSlot(null);
+                    }}
+                  >
+                    <div style={styles.sequencerEmptySlotIndicator}></div>
+                    <div style={styles.sequencerEmptySlotPlus}>+</div>
+                    <div style={styles.sequencerEmptySlotLabel}>Empty</div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -2957,6 +3365,7 @@ export default function TestSynth() {
           <div style={styles.sequencerStepsGrid}>
           {sequencerSteps.map((step, index) => {
             const isActive = step && step.active;
+            const isTied = step && step.tied;
             const isDownbeat = index % 4 === 0;
             const isRecordingCursor = isRecording && index === recordingIndex;
             return (
@@ -2966,7 +3375,8 @@ export default function TestSynth() {
                 style={{
                   ...styles.sequencerStepButton,
                   ...(!isActive && isDownbeat ? styles.sequencerStepButtonDownbeat : {}),
-                  ...(isActive ? styles.sequencerStepButtonActive : {}),
+                  ...(isActive && !isTied ? styles.sequencerStepButtonActive : {}),
+                  ...(isActive && isTied ? styles.sequencerStepButtonTied : {}),
                   ...(currentStep === index ? styles.sequencerStepButtonCurrent : {}),
                   ...(isRecordingCursor ? styles.sequencerStepButtonRecordingCursor : {}),
                 }}
@@ -2975,10 +3385,24 @@ export default function TestSynth() {
                     setRecordingIndex(index); // click-to-set cursor
                     return;
                   }
+                  // Multi-Click Tie Workflow: Cycle through 3 states
+                  // State A (Empty): !active -> active: true, tied: false
+                  // State B (Standard): active && !tied -> active: true, tied: true
+                  // State C (Tied): active && tied -> active: false, tied: false
                   setSequencerSteps(prev =>
-                    prev.map((s, i) =>
-                      i === index ? { active: !s.active, note: null } : s
-                    )
+                    prev.map((s, i) => {
+                      if (i !== index) return s;
+                      if (!s.active) {
+                        // State A -> State B
+                        return { active: true, tied: false, note: s.note };
+                      } else if (s.active && !s.tied) {
+                        // State B -> State C
+                        return { active: true, tied: true, note: s.note };
+                      } else {
+                        // State C -> State A
+                        return { active: false, tied: false, note: null };
+                      }
+                    })
                   );
                 }}
                 title={step.note ? `Step ${index + 1}: ${step.note}` : `Step ${index + 1}`}
