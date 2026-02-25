@@ -3,16 +3,36 @@ import WebAudioRenderer from '@elemaudio/web-renderer';
 
 const core = new WebAudioRenderer();
 
+function makeDistortionCurve(amount) {
+  const k = typeof amount === 'number' ? amount : 50;
+  const n_samples = 44100;
+  const curve = new Float32Array(n_samples);
+  const deg = Math.PI / 180;
+  for (let i = 0; i < n_samples; ++i) {
+    const x = i * 2 / n_samples - 1;
+    curve[i] = (3 + k) * x * 20 * deg / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
+}
+
 let mixerNode;
 let isPolyphonic = false;
 let globalSustainMode = false;
 let currentCutoffNorm = 1.0; // 0–1, maps to 20Hz–20kHz
 const activeVoices = new Map(); // frequency -> SynthVoice
 
+// Mixer volume nodes (feed Master Limiter)
+let synthVolumeNode;
+let seqVolumeNode;
+let masterCompressor;
+
+// Analog distortion (before volume)
+let synthDistortionNode;
+let seqDistortionNode;
+
 // Sequencer FX Bus
 let seqFxInput;
 let seqFxOutput;
-let seqLimiter;
 let activeSeqFxNodes = [];
 let currentSeqSlots = [];
 
@@ -85,20 +105,33 @@ export async function initAudio() {
       seqFxOutput = ctx.createGain();
       seqFxInput.connect(seqFxOutput); // Default bypass until updateSeqEffectsChain runs
       
-      // Add Master Limiter to prevent clipping
-      seqLimiter = ctx.createDynamicsCompressor();
-      seqLimiter.threshold.value = -3.0;
-      seqLimiter.ratio.value = 20.0; // Hard limit
-      seqLimiter.attack.value = 0.005;
-      seqLimiter.release.value = 0.050;
-      
-      seqFxOutput.connect(seqLimiter);
-      // Connect to mixerNode if it exists, otherwise to destination
-      if (mixerNode) {
-        seqLimiter.connect(mixerNode);
-      } else {
-        seqLimiter.connect(ctx.destination);
+      if (!synthVolumeNode || !seqVolumeNode || !masterCompressor) {
+        synthVolumeNode = ctx.createGain();
+        seqVolumeNode = ctx.createGain();
+        synthVolumeNode.gain.value = 1;
+        seqVolumeNode.gain.value = 1;
+        masterCompressor = ctx.createDynamicsCompressor();
+        masterCompressor.threshold.value = -3.0;
+        masterCompressor.ratio.value = 20.0;
+        masterCompressor.attack.value = 0.005;
+        masterCompressor.release.value = 0.050;
+        synthVolumeNode.connect(masterCompressor);
+        seqVolumeNode.connect(masterCompressor);
+        if (mixerNode) {
+          masterCompressor.connect(mixerNode);
+        } else {
+          masterCompressor.connect(ctx.destination);
+        }
       }
+      if (!synthDistortionNode || !seqDistortionNode) {
+        synthDistortionNode = ctx.createWaveShaper();
+        synthDistortionNode.oversample = '4x';
+        seqDistortionNode = ctx.createWaveShaper();
+        seqDistortionNode.oversample = '4x';
+        synthDistortionNode.connect(synthVolumeNode);
+        seqDistortionNode.connect(seqVolumeNode);
+      }
+      seqFxOutput.connect(seqDistortionNode);
     }
     return { core, analyser: window.globalAnalyser };
   }
@@ -113,20 +146,33 @@ export async function initAudio() {
   mixerNode.connect(analyser);
   analyser.connect(ctx.destination);
 
+  // Mixer volume nodes and Master Limiter
+  synthVolumeNode = ctx.createGain();
+  seqVolumeNode = ctx.createGain();
+  synthVolumeNode.gain.value = 1;
+  seqVolumeNode.gain.value = 1;
+  masterCompressor = ctx.createDynamicsCompressor();
+  masterCompressor.threshold.value = -3.0;
+  masterCompressor.ratio.value = 20.0;
+  masterCompressor.attack.value = 0.005;
+  masterCompressor.release.value = 0.050;
+  synthVolumeNode.connect(masterCompressor);
+  seqVolumeNode.connect(masterCompressor);
+  masterCompressor.connect(mixerNode);
+
+  // Analog distortion (before volume)
+  synthDistortionNode = ctx.createWaveShaper();
+  synthDistortionNode.oversample = '4x';
+  seqDistortionNode = ctx.createWaveShaper();
+  seqDistortionNode.oversample = '4x';
+  synthDistortionNode.connect(synthVolumeNode);
+  seqDistortionNode.connect(seqVolumeNode);
+
   // Initialize Sequencer FX Bus
   seqFxInput = ctx.createGain();
   seqFxOutput = ctx.createGain();
   seqFxInput.connect(seqFxOutput); // Default bypass until updateSeqEffectsChain runs
-  
-  // Add Master Limiter to prevent clipping
-  seqLimiter = ctx.createDynamicsCompressor();
-  seqLimiter.threshold.value = -3.0;
-  seqLimiter.ratio.value = 20.0; // Hard limit
-  seqLimiter.attack.value = 0.005;
-  seqLimiter.release.value = 0.050;
-  
-  seqFxOutput.connect(seqLimiter);
-  seqLimiter.connect(mixerNode); // Route sequencer FX output through limiter to main mixer
+  seqFxOutput.connect(seqDistortionNode);
 
   window.globalAnalyser = analyser;
   return { core, analyser };
@@ -151,7 +197,8 @@ export function playTone(freq = 440, waveform = 'sine', velocity = 0.8) {
     activeVoices.delete(freq);
   }
 
-  const voice = new SynthVoice(ctx, freq, mixerNode, waveform, velocity);
+  const dest = synthDistortionNode || synthVolumeNode || mixerNode;
+  const voice = new SynthVoice(ctx, freq, dest, waveform, velocity);
   voice.start();
   activeVoices.set(freq, voice);
 }
@@ -207,8 +254,9 @@ export function getFilterDiagnostics() {
  * @param {boolean} isTiedFromPrev - If true, skip attack/decay (legato continue)
  * @param {boolean} isTiedToNext - If true, hold gate open (legato hold)
  * @param {number} stepDuration - Duration of one step in seconds (for BPM scaling)
+ * @param {function|null} debugCallback - If provided, called with a diagnostic string (for Debug UI)
  */
-export function triggerSequencerStep(noteName, time, params = {}, isTiedFromPrev = false, isTiedToNext = false, stepDuration = 0.25) {
+export function triggerSequencerStep(noteName, time, params = {}, isTiedFromPrev = false, isTiedToNext = false, stepDuration = 0.25, debugCallback = null) {
   const ctx = window.globalAudioContext;
   if (!ctx || !mixerNode) return;
 
@@ -268,6 +316,15 @@ export function triggerSequencerStep(noteName, time, params = {}, isTiedFromPrev
   osc.connect(filter);
   filter.connect(env);
   env.connect(seqFxInput || mixerNode); // Fallback to mixerNode if bus not initialized
+
+  // Live parameter dump / wiretap for Debug UI
+  if (debugCallback) {
+    const actualFreq = osc.frequency.value;
+    const waveType = osc.type;
+    const gainMax = 1.0;
+    const debugString = `SEQ FIRE | Wave: ${waveType} | Freq: ${Math.round(actualFreq)}Hz | MaxGain: ${gainMax} | aTime: ${aTime.toFixed(3)}s | dTime: ${dTime.toFixed(3)}s | Gate: ${gateLength.toFixed(3)}s`;
+    debugCallback(debugString);
+  }
 
   // 3. Attack / Legato Continue Phase
   if (isTiedFromPrev) {
@@ -383,5 +440,33 @@ export function updateSeqEffectsChain(slots, values) {
     }
     // Future effects can be added here:
     // else if (effectName === 'Resonance') { ... }
+  }
+}
+
+/** Map 0–100 fader values to gain with squared taper; call from UI when mixer faders change. */
+export function updateMixerVolumes(synthVol, seqVol) {
+  const ctx = window.globalAudioContext;
+  if (!ctx || !synthVolumeNode || !seqVolumeNode) return;
+  const sGain = Math.pow(Number(synthVol) / 100, 2);
+  const qGain = Math.pow(Number(seqVol) / 100, 2);
+  synthVolumeNode.gain.setTargetAtTime(sGain, ctx.currentTime, 0.05);
+  seqVolumeNode.gain.setTargetAtTime(qGain, ctx.currentTime, 0.05);
+}
+
+export function updateSynthDistortion(amount) {
+  if (!synthDistortionNode) return;
+  if (amount <= 0) {
+    synthDistortionNode.curve = null;
+  } else {
+    synthDistortionNode.curve = makeDistortionCurve(amount * 4);
+  }
+}
+
+export function updateSeqDistortion(amount) {
+  if (!seqDistortionNode) return;
+  if (amount <= 0) {
+    seqDistortionNode.curve = null;
+  } else {
+    seqDistortionNode.curve = makeDistortionCurve(amount * 4);
   }
 }

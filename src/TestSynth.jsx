@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState, resumeAudioContext, triggerSequencerStep, updateSeqEffectsChain } from './audio/AudioEngine';
+import { initAudio, playTone, stopTone, updateSynthParams, getFilterDiagnostics, setPolyphony, setSustainMode, getVisualState, resumeAudioContext, triggerSequencerStep, updateSeqEffectsChain, updateMixerVolumes, updateSynthDistortion, updateSeqDistortion } from './audio/AudioEngine';
 
 /** 'Delay Time' -> 'delayTime', 'Env Amt' -> 'envAmt' */
 function toCamelCase(str) {
@@ -280,6 +280,7 @@ export default function TestSynth() {
   const [editingKnob, setEditingKnob] = useState(null); // Track which knob is being edited
   const [logs, setLogs] = useState([{ message: 'Waiting for input...', type: 'log' }]);
   const [showDebug, setShowDebug] = useState(false);
+  const [seqDebugMsg, setSeqDebugMsg] = useState('Waiting for sequence...');
   const [filterDiagnostic, setFilterDiagnostic] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
@@ -312,6 +313,10 @@ export default function TestSynth() {
   const [seqRelease, setSeqRelease] = useState(0.2); // 0-1
   const [seqFxSlots, setSeqFxSlots] = useState(Array(4).fill(null)); // 4 effect slots
   const [seqFxValues, setSeqFxValues] = useState(Array(4).fill(0.5)); // Values for sequencer FX slots (0-1)
+  const [synthVol, setSynthVol] = useState(80);
+  const [seqVol, setSeqVol] = useState(80);
+  const [synthDistortion, setSynthDistortion] = useState(0);
+  const [seqDistortion, setSeqDistortion] = useState(0);
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
   const visorDisplayRef = useRef(null);
@@ -331,6 +336,15 @@ export default function TestSynth() {
   useEffect(() => {
     addLogRef.current = addLog;
   });
+
+  useEffect(() => {
+    updateMixerVolumes(synthVol, seqVol);
+  }, [synthVol, seqVol]);
+
+  useEffect(() => {
+    updateSynthDistortion(synthDistortion);
+    updateSeqDistortion(seqDistortion);
+  }, [synthDistortion, seqDistortion]);
 
   // Update filter diagnostic in real-time when Debug Panel is open (for Cutoff knob verification)
   useEffect(() => {
@@ -583,8 +597,11 @@ export default function TestSynth() {
         
         const keyInfo = PIANO_KEYS.find(k => k.key === key);
         const noteName = KEY_TO_NOTE[key];
-        const noteDisplay = getNoteDisplay(noteName); // e.g. 'C4', 'C#3'
-        let frequency = keyInfo ? getFrequencyFromIndex(keyInfo.absoluteIndex, octave) : getFrequency(noteName, octave);
+        const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        const noteIndex = keyInfo ? keyInfo.absoluteIndex : noteNames.indexOf(noteName);
+        const trueOctave = octave + Math.floor(noteIndex / 12);
+        const noteString = noteNames[noteIndex % 12] + trueOctave;
+        let frequency = getFrequency(noteNames[noteIndex % 12], trueOctave);
         
         // Apply pitch bend
         if (pitchBend !== 0) {
@@ -595,7 +612,7 @@ export default function TestSynth() {
         if (isRecording) {
           setSequencerSteps(prev => {
             const next = prev.map((step, i) =>
-              i === recordingIndex ? { active: true, tied: false, note: noteDisplay } : step
+              i === recordingIndex ? { active: true, tied: false, note: noteString } : step
             );
             return next;
           });
@@ -722,7 +739,7 @@ export default function TestSynth() {
             decay: p.seqDecay * 100,
             sustain: p.seqSustain * 100,
             release: p.seqRelease * 100,
-          }, isTiedFromPrev, isTiedToNext, stepDuration);
+          }, isTiedFromPrev, isTiedToNext, stepDuration, (msg) => setSeqDebugMsg(msg));
         }
 
         // B. Update UI (throttle updates to avoid React choking)
@@ -1079,8 +1096,10 @@ export default function TestSynth() {
   const styles = {
     studioLayout: {
       display: 'flex',
+      flexDirection: 'row',
+      flexWrap: 'nowrap',
       justifyContent: 'center',
-      gap: '20px',
+      gap: '15px',
       alignItems: 'flex-start',
       width: '100%',
       maxWidth: '1200px',
@@ -1942,7 +1961,17 @@ export default function TestSynth() {
 
   return (
     <React.Fragment>
-      <style dangerouslySetInnerHTML={{ __html: '@keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.9; } } body, #root { user-select: none; -webkit-user-select: none; }' }} />
+      <style dangerouslySetInnerHTML={{ __html: `@keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.9; } } body, #root { user-select: none; -webkit-user-select: none; }
+.mixer-spine { width: 70px; min-width: 70px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; border: 2px solid #333; border-radius: 8px; padding: 15px 0; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); flex-shrink: 0; }
+.mixer-header { color: #888; font-size: 10px; font-weight: bold; letter-spacing: 1px; margin-bottom: 15px; }
+.faders-container { display: flex; gap: 8px; }
+.fader-channel { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.fader-label, .fader-readout { color: #888; font-size: 9px; font-family: monospace; }
+.vertical-fader { -webkit-appearance: slider-vertical; writing-mode: bt-lr; width: 6px; height: 120px; background: #000; outline: none; border-radius: 3px; box-shadow: inset 0 0 5px rgba(0,0,0,1); margin: 0; }
+.vertical-fader::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 8px; background: #555; border-radius: 2px; cursor: pointer; }
+.synth-fader::-webkit-slider-thumb { border: 1px solid #4a90e2; box-shadow: 0 0 5px #4a90e2; }
+.seq-fader::-webkit-slider-thumb { border: 1px solid #00FFFF; box-shadow: 0 0 5px #00FFFF; }
+` }} />
       {/* Drawer Overlay */}
       {libraryOpen && (
         <div
@@ -2019,6 +2048,7 @@ export default function TestSynth() {
       </div>
 
       {/* Studio Layout Wrapper */}
+      <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'center', gap: '15px' }}>
       <div style={styles.studioLayout}>
       <div
         style={{
@@ -2587,6 +2617,25 @@ export default function TestSynth() {
             {[0, 1, 2, 3].map((slotIndex) => {
               const assignedParam = assignedSlots[slotIndex];
               const isDragOver = dragOverSlot === slotIndex;
+
+              if (slotIndex === 0) {
+                return (
+                  <div key="left-knob-drive" style={styles.activeKnobContainer}>
+                    <div style={{ ...styles.activeKnob, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={synthDistortion}
+                        onChange={(e) => setSynthDistortion(Number(e.target.value))}
+                        style={{ width: '70%', accentColor: '#e85c2b' }}
+                      />
+                      <span style={{ fontSize: '10px', color: '#e85c2b', fontWeight: 'bold' }}>{synthDistortion}</span>
+                    </div>
+                    <div style={{ ...styles.activeKnobLabel, color: '#e85c2b' }}>DRIVE</div>
+                  </div>
+                );
+              }
               
               if (assignedParam) {
                 const knobValue = slotValues[slotIndex];
@@ -3038,6 +3087,22 @@ export default function TestSynth() {
         </div>
     </div>
 
+      <div className="mixer-spine">
+        <div className="mixer-header">MIX</div>
+        <div className="faders-container">
+          <div className="fader-channel">
+            <span className="fader-readout">{synthVol}</span>
+            <input type="range" min="0" max="100" value={synthVol} onChange={(e) => setSynthVol(Number(e.target.value))} className="vertical-fader synth-fader" />
+            <span className="fader-label">SYN</span>
+          </div>
+          <div className="fader-channel">
+            <span className="fader-readout">{seqVol}</span>
+            <input type="range" min="0" max="100" value={seqVol} onChange={(e) => setSeqVol(Number(e.target.value))} className="vertical-fader seq-fader" />
+            <span className="fader-label">SEQ</span>
+          </div>
+        </div>
+      </div>
+
       {/* Sequencer Sidecar */}
       <div style={styles.sequencerSidecar}>
         {/* Master LCD (Transport, BPM, Waveform) */}
@@ -3153,6 +3218,35 @@ export default function TestSynth() {
               {seqFxSlots.map((fx, index) => {
                 const isDragOver = dragOverSeqSlot === index;
                 const assignedFx = seqFxSlots[index];
+
+                if (index === 0) {
+                  return (
+                    <div
+                      key="seq-fx-drive"
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        width: '60px',
+                        userSelect: 'none',
+                      }}
+                    >
+                      <div style={{ width: '40px', height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={seqDistortion}
+                          onChange={(e) => setSeqDistortion(Number(e.target.value))}
+                          style={{ width: '100%', accentColor: '#e85c2b' }}
+                        />
+                      </div>
+                      <div style={{ fontSize: '7px', color: '#e85c2b', textAlign: 'center', marginTop: '4px', textTransform: 'uppercase', fontWeight: 'bold' }}>
+                        DRIVE
+                      </div>
+                    </div>
+                  );
+                }
                 
                 if (assignedFx) {
                   // Active FX slot with interactive knob
@@ -3415,6 +3509,7 @@ export default function TestSynth() {
         </div>
       </div>
       </div>
+      </div>
 
       {/* Debug Toggle Button */}
       <button
@@ -3462,6 +3557,9 @@ export default function TestSynth() {
         >
           <div>Audio Context: {window.globalAudioContext ? window.globalAudioContext.state : 'Not Created'}</div>
           <div>{filterDiagnostic || getFilterDiagnostics()}</div>
+          <div style={{ color: '#00FFFF', fontFamily: 'monospace', marginTop: '10px' }}>
+            {seqDebugMsg}
+          </div>
           {logs.map((logEntry, i) => {
             const color = logEntry.type === 'error' ? '#f00' : logEntry.type === 'warn' ? '#ff0' : '#0f0';
             return (
