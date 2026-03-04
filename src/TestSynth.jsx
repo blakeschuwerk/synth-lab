@@ -62,6 +62,35 @@ PIANO_KEYS.forEach(keyInfo => {
 
 const WAVEFORMS = ['sine', 'triangle', 'square', 'saw'];
 
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const SCALES = {
+  Major: [0, 2, 4, 5, 7, 9, 11],
+  Minor: [0, 2, 3, 5, 7, 8, 10],
+};
+
+function getNoteFromDegree(rootNote, scaleType, baseOctave, degree) {
+  if (degree === 0) return null;
+  const rootIndex = NOTE_NAMES.indexOf(rootNote);
+  const scale = SCALES[scaleType];
+  if (!scale) return null;
+  const zeroBasedDegree = degree - 1;
+  const octaveShift = Math.floor(zeroBasedDegree / 7);
+  const scaleIndex = zeroBasedDegree % 7;
+  const semitonesFromRoot = scale[scaleIndex];
+  const absoluteIndex = rootIndex + semitonesFromRoot;
+  const finalOctave = baseOctave + octaveShift + Math.floor(absoluteIndex / 12);
+  const finalNote = NOTE_NAMES[((absoluteIndex % 12) + 12) % 12];
+  return `${finalNote}${finalOctave}`;
+}
+
+const SEQ_PRESETS = {
+  Ascending: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  'Up & Down': [1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 2],
+  'Broken Chords': [1, 3, 5, 3, 2, 4, 6, 4, 3, 5, 7, 5, 4, 6, 8, 6],
+  'Octave Bounce': [1, 8, 1, 8, 2, 9, 2, 9, 3, 10, 3, 10, 4, 11, 4, 11],
+  'Pedal Point': [1, 5, 1, 6, 1, 7, 1, 8, 1, 7, 1, 6, 1, 5, 1, 4],
+};
+
 const DiagnosticProbe = ({ audioPlaying, analyzer, width, height }) => (
   <div style={{
     position: 'absolute',
@@ -317,6 +346,8 @@ export default function TestSynth() {
   const [seqVol, setSeqVol] = useState(80);
   const [synthDistortion, setSynthDistortion] = useState(0);
   const [seqDistortion, setSeqDistortion] = useState(0);
+  const [seqRootKey, setSeqRootKey] = useState('C');
+  const [seqScale, setSeqScale] = useState('Major');
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
   const visorDisplayRef = useRef(null);
@@ -327,6 +358,15 @@ export default function TestSynth() {
   const isSeqFxDropSuccessful = useRef(false);
   const addLogRef = useRef(null);
   const seqParamsRef = useRef({ seqAttack, seqDecay, seqSustain, seqRelease });
+  const seqEngineRef = useRef({
+    bpm: 120,
+    steps: [],
+    currentStep: 0,
+    nextNoteTime: 0,
+    seqWave: 'saw',
+    seqCutoff: 0.5,
+    seqRes: 0,
+  });
 
   const addLog = (msg, type = 'log') => {
     setLogs((prev) => [{ message: String(msg), type }, ...prev].slice(0, 100));
@@ -696,75 +736,67 @@ export default function TestSynth() {
     }
   }, [waveform, velocity, activeNotes]);
 
-  // Lookahead Scheduler: Master Clock for Sequencer Playback
+  // Lookahead Scheduler: Master Clock for Sequencer Playback (reads from seqEngineRef to avoid restarts on BPM/step change)
   useEffect(() => {
     if (!isPlaying || !audioInitialized.current || !window.globalAudioContext) {
+      seqEngineRef.current.currentStep = 0;
       setCurrentStep(-1);
       return;
     }
 
     const ctx = window.globalAudioContext;
     let timerID;
-    let nextNoteTime = ctx.currentTime + 0.1; // 100ms lookahead
-    let currentStepIndex = 0;
+    seqEngineRef.current.nextNoteTime = ctx.currentTime + 0.1;
+    seqEngineRef.current.currentStep = 0;
 
-    // Calculate step duration (16th notes: 4 steps per beat)
-    const secondsPerBeat = 60.0 / bpm;
-    const stepDuration = secondsPerBeat / 4;
-
-    // Scheduler function with lookahead
     const schedule = () => {
-      while (nextNoteTime < ctx.currentTime + 0.1) {
-        // Recalculate loop length dynamically (in case steps changed during playback)
-        const loopLength = calculateLoopLength(sequencerStepsRef.current);
-        
-        // A. Play the Note
-        const step = sequencerStepsRef.current[currentStepIndex];
+      const steps = seqEngineRef.current.steps;
+      const bpm = seqEngineRef.current.bpm;
+      const secondsPerBeat = 60.0 / bpm;
+      const stepDuration = secondsPerBeat / 4;
+
+      while (seqEngineRef.current.nextNoteTime < ctx.currentTime + 0.1) {
+        const loopLength = calculateLoopLength(steps);
+        const currentStepIndex = seqEngineRef.current.currentStep;
+        const step = steps[currentStepIndex];
+
         if (step && step.active && step.note) {
-          // Calculate tie states for Legato
           const isTiedFromPrev = step.tied;
-          let isTiedToNext = false;
           const nextStepIndex = (currentStepIndex + 1) % loopLength;
-          const nextStep = sequencerStepsRef.current[nextStepIndex];
-          if (nextStep && nextStep.active && nextStep.tied) {
-            isTiedToNext = true;
-          }
-          
+          const nextStep = steps[nextStepIndex];
+          const isTiedToNext = !!(nextStep && nextStep.active && nextStep.tied);
+
           const p = seqParamsRef.current;
-          triggerSequencerStep(step.note, nextNoteTime, {
-            wave: seqWave,
-            cutoff: seqCutoff,
-            res: seqRes,
-            attack: p.seqAttack * 100, // Convert 0-1 to 0-100 for ADSR formula
+          const e = seqEngineRef.current;
+          triggerSequencerStep(step.note, seqEngineRef.current.nextNoteTime, {
+            wave: e.seqWave,
+            cutoff: e.seqCutoff,
+            res: e.seqRes,
+            attack: p.seqAttack * 100,
             decay: p.seqDecay * 100,
             sustain: p.seqSustain * 100,
             release: p.seqRelease * 100,
           }, isTiedFromPrev, isTiedToNext, stepDuration, (msg) => setSeqDebugMsg(msg));
         }
 
-        // B. Update UI (throttle updates to avoid React choking)
         const stepIndexToShow = currentStepIndex;
-        requestAnimationFrame(() => {
-          setCurrentStep(stepIndexToShow);
-        });
+        requestAnimationFrame(() => setCurrentStep(stepIndexToShow));
 
-        // C. Advance Time & Index
-        nextNoteTime += stepDuration;
-        currentStepIndex = (currentStepIndex + 1) % loopLength;
+        seqEngineRef.current.nextNoteTime += stepDuration;
+        seqEngineRef.current.currentStep = (currentStepIndex + 1) % loopLength;
       }
 
       timerID = setTimeout(schedule, 25.0);
     };
 
-    // Start scheduling
     schedule();
 
-    // Cleanup
     return () => {
       if (timerID) clearTimeout(timerID);
+      seqEngineRef.current.currentStep = 0;
       setCurrentStep(-1);
     };
-  }, [isPlaying, bpm, sequencerSteps, seqWave, seqCutoff, seqRes]);
+  }, [isPlaying]);
 
   const getNoteDisplay = (noteName) => `${noteName}${octave}`;
 
@@ -778,6 +810,26 @@ export default function TestSynth() {
     return Math.min(16, Math.ceil((lastActiveIndex + 1) / 4) * 4);
   };
 
+  const injectSequencePattern = (patternArray) => {
+    setSequencerSteps((prevSteps) =>
+      prevSteps.map((step, i) => {
+        const degree = patternArray[i % patternArray.length];
+        const newNote = getNoteFromDegree(seqRootKey, seqScale, 3, degree);
+        return {
+          ...step,
+          note: degree !== 0 ? (newNote ?? step.note) : null,
+          active: degree !== 0,
+          tied: false,
+        };
+      })
+    );
+  };
+
+  const injectRandomSequence = () => {
+    const randomPattern = Array.from({ length: 16 }, () => Math.floor(Math.random() * 8) + 1);
+    injectSequencePattern(randomPattern);
+  };
+
   const sequencerStepsRef = useRef(sequencerSteps);
   useEffect(() => {
     sequencerStepsRef.current = sequencerSteps;
@@ -786,6 +838,14 @@ export default function TestSynth() {
   useEffect(() => {
     seqParamsRef.current = { seqAttack, seqDecay, seqSustain, seqRelease };
   }, [seqAttack, seqDecay, seqSustain, seqRelease]);
+
+  useEffect(() => {
+    seqEngineRef.current.bpm = bpm;
+    seqEngineRef.current.steps = sequencerSteps;
+    seqEngineRef.current.seqWave = seqWave;
+    seqEngineRef.current.seqCutoff = seqCutoff;
+    seqEngineRef.current.seqRes = seqRes;
+  }, [bpm, sequencerSteps, seqWave, seqCutoff, seqRes]);
 
   // Update sequencer FX chain when slots or values change
   useEffect(() => {
@@ -854,7 +914,7 @@ export default function TestSynth() {
   };
 
   // SVG Arc Knob — 270° arc from 135° (7 o'clock) to 405° (5 o'clock)
-  const KnobSVG = ({ value, isDragging, label }) => {
+  const KnobSVG = ({ value, isDragging, label, accentColor = '#00f0ff' }) => {
     const size = 80;
     const center = size / 2;
     const radius = 30;
@@ -877,9 +937,9 @@ export default function TestSynth() {
     return (
       <svg width={size} height={size} style={{ position: 'absolute', top: 0, left: 0 }} pointerEvents="none">
         <path d={trackD} fill="none" stroke="#333" strokeWidth={6} strokeLinecap="round" />
-        <path d={valueD} fill="none" stroke="#00f0ff" strokeWidth={6} strokeLinecap="round" />
+        <path d={valueD} fill="none" stroke={accentColor} strokeWidth={6} strokeLinecap="round" />
         {isDragging && (
-          <text x={center} y={center + 4} textAnchor="middle" fontSize="10" fill="#00f0ff" fontWeight="600">
+          <text x={center} y={center + 4} textAnchor="middle" fontSize="10" fill={accentColor} fontWeight="600">
             {Math.round(v * 100)}
           </text>
         )}
@@ -888,7 +948,7 @@ export default function TestSynth() {
   };
 
   // Sequencer FX Knob Component (40px) - matches main synth knob but smaller
-  const SequencerFxKnobSVG = ({ value, isDragging }) => {
+  const SequencerFxKnobSVG = ({ value, isDragging, accentColor = '#00f0ff' }) => {
     const size = 40;
     const center = size / 2;
     const radius = 15;
@@ -911,9 +971,9 @@ export default function TestSynth() {
     return (
       <svg width={size} height={size} style={{ position: 'absolute', top: 0, left: 0 }} pointerEvents="none">
         <path d={trackD} fill="none" stroke="#333" strokeWidth={4} strokeLinecap="round" />
-        <path d={valueD} fill="none" stroke="#00f0ff" strokeWidth={4} strokeLinecap="round" />
+        <path d={valueD} fill="none" stroke={accentColor} strokeWidth={4} strokeLinecap="round" />
         {isDragging && (
-          <text x={center} y={center + 3} textAnchor="middle" fontSize="8" fill="#00f0ff" fontWeight="600">
+          <text x={center} y={center + 3} textAnchor="middle" fontSize="8" fill={accentColor} fontWeight="600">
             {Math.round(v * 100)}
           </text>
         )}
@@ -1694,17 +1754,21 @@ export default function TestSynth() {
       background: 'rgba(0,0,0,0.3)',
       borderRadius: '8px',
       boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.6)',
-      padding: '10px',
+      padding: '5px',
+      width: '100%',
+      boxSizing: 'border-box',
     },
     sequencerStepsGrid: {
       display: 'grid',
       gridTemplateColumns: 'repeat(8, 1fr)',
-      gridTemplateRows: 'repeat(2, 1fr)',
-      gap: '6px',
+      gap: '5px',
+      width: '100%',
+      boxSizing: 'border-box',
     },
     sequencerStepButton: {
-      width: '40px',
-      height: '40px',
+      width: '100%',
+      height: '35px',
+      minWidth: 0,
       borderRadius: '4px',
       border: '1px solid #333',
       borderBottom: '2px solid rgba(0,0,0,0.5)',
@@ -2617,31 +2681,13 @@ export default function TestSynth() {
             {[0, 1, 2, 3].map((slotIndex) => {
               const assignedParam = assignedSlots[slotIndex];
               const isDragOver = dragOverSlot === slotIndex;
+              const isDrive = assignedParam === 'Drive';
 
-              if (slotIndex === 0) {
-                return (
-                  <div key="left-knob-drive" style={styles.activeKnobContainer}>
-                    <div style={{ ...styles.activeKnob, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
-                        value={synthDistortion}
-                        onChange={(e) => setSynthDistortion(Number(e.target.value))}
-                        style={{ width: '70%', accentColor: '#e85c2b' }}
-                      />
-                      <span style={{ fontSize: '10px', color: '#e85c2b', fontWeight: 'bold' }}>{synthDistortion}</span>
-                    </div>
-                    <div style={{ ...styles.activeKnobLabel, color: '#e85c2b' }}>DRIVE</div>
-                  </div>
-                );
-              }
-              
               if (assignedParam) {
-                const knobValue = slotValues[slotIndex];
+                const knobValue = isDrive ? synthDistortion / 100 : slotValues[slotIndex];
                 const isEditing = editingKnob === slotIndex;
                 const isDragging = draggingKnob === slotIndex;
-                
+
                 return (
                   <div
                     key={`left-knob-${slotIndex}`}
@@ -2689,32 +2735,49 @@ export default function TestSynth() {
                         setEditingKnob(slotIndex);
                         knobDragStartY.current = e.clientY;
                         knobDragStartValue.current = knobValue;
-                        
+
                         const handleMouseMove = (moveEvent) => {
                           const deltaY = knobDragStartY.current - moveEvent.clientY;
                           const sensitivity = 0.005;
                           const newValue = Math.max(0, Math.min(1, knobDragStartValue.current + deltaY * sensitivity));
-                          setSlotValues(prev => {
-                            const newValues = [...prev];
-                            newValues[slotIndex] = newValue;
-                            return newValues;
-                          });
+                          if (isDrive) {
+                            setSynthDistortion(Math.round(newValue * 100));
+                            setSlotValues(prev => {
+                              const newValues = [...prev];
+                              newValues[slotIndex] = newValue;
+                              return newValues;
+                            });
+                          } else {
+                            setSlotValues(prev => {
+                              const newValues = [...prev];
+                              newValues[slotIndex] = newValue;
+                              return newValues;
+                            });
+                          }
                         };
-                        
+
                         const handleMouseUp = () => {
                           setEditingKnob(null);
                           document.removeEventListener('mousemove', handleMouseMove);
                           document.removeEventListener('mouseup', handleMouseUp);
                         };
-                        
+
                         document.addEventListener('mousemove', handleMouseMove);
                         document.addEventListener('mouseup', handleMouseUp);
                       }}
                     >
-                      <KnobSVG value={knobValue} isDragging={isEditing} label={assignedParam} />
+                      <KnobSVG
+                        value={knobValue}
+                        isDragging={isEditing}
+                        label={isDrive ? 'DRIVE' : assignedParam}
+                        accentColor={isDrive ? '#FF9500' : undefined}
+                      />
                     </div>
                     <div
-                      style={styles.activeKnobLabel}
+                      style={{
+                        ...styles.activeKnobLabel,
+                        ...(isDrive ? { color: '#FF9500' } : {}),
+                      }}
                       draggable={true}
                       onDragStart={(e) => {
                         isDropSuccessful.current = false;
@@ -2737,10 +2800,10 @@ export default function TestSynth() {
                         setDraggingKnob(null);
                         isDropSuccessful.current = false;
                       }}
-                      onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.color = '#888'; }}
+                      onMouseEnter={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#fff'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#888'; }}
                     >
-                      {assignedParam}
+                      {isDrive ? 'DRIVE' : assignedParam}
                     </div>
                   </div>
                 );
@@ -2788,12 +2851,10 @@ export default function TestSynth() {
                           setSlotValues(prev => {
                             const next = [...prev];
                             if (existingIndex !== -1 && existingIndex !== slotIndex) {
-                              // Move value from old slot
                               next[slotIndex] = existingValue;
                               next[existingIndex] = 0.5;
                             } else {
-                              // New effect, default value
-                              next[slotIndex] = 0.5;
+                              next[slotIndex] = paramName === 'Drive' ? synthDistortion / 100 : 0.5;
                             }
                             return next;
                           });
@@ -2842,12 +2903,13 @@ export default function TestSynth() {
             {[4, 5, 6, 7].map((slotIndex) => {
               const assignedParam = assignedSlots[slotIndex];
               const isDragOver = dragOverSlot === slotIndex;
-              
+              const isDrive = assignedParam === 'Drive';
+
               if (assignedParam) {
-                const knobValue = slotValues[slotIndex];
+                const knobValue = isDrive ? synthDistortion / 100 : slotValues[slotIndex];
                 const isEditing = editingKnob === slotIndex;
                 const isDragging = draggingKnob === slotIndex;
-                
+
                 return (
                   <div
                     key={`right-knob-${slotIndex}`}
@@ -2895,32 +2957,49 @@ export default function TestSynth() {
                         setEditingKnob(slotIndex);
                         knobDragStartY.current = e.clientY;
                         knobDragStartValue.current = knobValue;
-                        
+
                         const handleMouseMove = (moveEvent) => {
                           const deltaY = knobDragStartY.current - moveEvent.clientY;
                           const sensitivity = 0.005;
                           const newValue = Math.max(0, Math.min(1, knobDragStartValue.current + deltaY * sensitivity));
-                          setSlotValues(prev => {
-                            const newValues = [...prev];
-                            newValues[slotIndex] = newValue;
-                            return newValues;
-                          });
+                          if (isDrive) {
+                            setSynthDistortion(Math.round(newValue * 100));
+                            setSlotValues(prev => {
+                              const newValues = [...prev];
+                              newValues[slotIndex] = newValue;
+                              return newValues;
+                            });
+                          } else {
+                            setSlotValues(prev => {
+                              const newValues = [...prev];
+                              newValues[slotIndex] = newValue;
+                              return newValues;
+                            });
+                          }
                         };
-                        
+
                         const handleMouseUp = () => {
                           setEditingKnob(null);
                           document.removeEventListener('mousemove', handleMouseMove);
                           document.removeEventListener('mouseup', handleMouseUp);
                         };
-                        
+
                         document.addEventListener('mousemove', handleMouseMove);
                         document.addEventListener('mouseup', handleMouseUp);
                       }}
                     >
-                      <KnobSVG value={knobValue} isDragging={isEditing} label={assignedParam} />
+                      <KnobSVG
+                        value={knobValue}
+                        isDragging={isEditing}
+                        label={isDrive ? 'DRIVE' : assignedParam}
+                        accentColor={isDrive ? '#FF9500' : undefined}
+                      />
                     </div>
                     <div
-                      style={styles.activeKnobLabel}
+                      style={{
+                        ...styles.activeKnobLabel,
+                        ...(isDrive ? { color: '#FF9500' } : {}),
+                      }}
                       draggable={true}
                       onDragStart={(e) => {
                         isDropSuccessful.current = false;
@@ -2943,10 +3022,10 @@ export default function TestSynth() {
                         setDraggingKnob(null);
                         isDropSuccessful.current = false;
                       }}
-                      onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.color = '#888'; }}
+                      onMouseEnter={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#fff'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#888'; }}
                     >
-                      {assignedParam}
+                      {isDrive ? 'DRIVE' : assignedParam}
                     </div>
                   </div>
                 );
@@ -3218,42 +3297,14 @@ export default function TestSynth() {
               {seqFxSlots.map((fx, index) => {
                 const isDragOver = dragOverSeqSlot === index;
                 const assignedFx = seqFxSlots[index];
+                const isDrive = assignedFx === 'Drive';
 
-                if (index === 0) {
-                  return (
-                    <div
-                      key="seq-fx-drive"
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        width: '60px',
-                        userSelect: 'none',
-                      }}
-                    >
-                      <div style={{ width: '40px', height: '40px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <input
-                          type="range"
-                          min="0"
-                          max="100"
-                          value={seqDistortion}
-                          onChange={(e) => setSeqDistortion(Number(e.target.value))}
-                          style={{ width: '100%', accentColor: '#e85c2b' }}
-                        />
-                      </div>
-                      <div style={{ fontSize: '7px', color: '#e85c2b', textAlign: 'center', marginTop: '4px', textTransform: 'uppercase', fontWeight: 'bold' }}>
-                        DRIVE
-                      </div>
-                    </div>
-                  );
-                }
-                
                 if (assignedFx) {
-                  // Active FX slot with interactive knob
-                  const knobValue = seqFxValues[index];
+                  // Active FX slot with interactive knob (incl. Drive with custom SVG + orange)
+                  const knobValue = isDrive ? seqDistortion / 100 : seqFxValues[index];
                   const isEditing = editingSeqFx === index;
                   const isDragging = draggingSeqFx === index;
-                  
+
                   return (
                     <div
                       key={index}
@@ -3280,14 +3331,16 @@ export default function TestSynth() {
                           const src = draggingSeqFx;
                           setSeqFxSlots(prev => {
                             const next = [...prev];
-                            next[index] = next[src];
-                            next[src] = null;
+                            const a = next[src];
+                            next[src] = next[index];
+                            next[index] = a;
                             return next;
                           });
                           setSeqFxValues(prev => {
                             const next = [...prev];
-                            next[index] = next[src];
-                            next[src] = 0.5;
+                            const a = next[src];
+                            next[src] = next[index];
+                            next[index] = a;
                             return next;
                           });
                           setDraggingSeqFx(null);
@@ -3309,38 +3362,52 @@ export default function TestSynth() {
                           setEditingSeqFx(index);
                           knobDragStartY.current = e.clientY;
                           knobDragStartValue.current = knobValue;
-                          
+
                           const handleMouseMove = (moveEvent) => {
                             const deltaY = knobDragStartY.current - moveEvent.clientY;
                             const sensitivity = 0.005;
                             const newValue = Math.max(0, Math.min(1, knobDragStartValue.current + deltaY * sensitivity));
-                            setSeqFxValues(prev => {
-                              const next = [...prev];
-                              next[index] = newValue;
-                              return next;
-                            });
+                            if (isDrive) {
+                              setSeqDistortion(Math.round(newValue * 100));
+                              setSeqFxValues(prev => {
+                                const next = [...prev];
+                                next[index] = newValue;
+                                return next;
+                              });
+                            } else {
+                              setSeqFxValues(prev => {
+                                const next = [...prev];
+                                next[index] = newValue;
+                                return next;
+                              });
+                            }
                           };
-                          
+
                           const handleMouseUp = () => {
                             setEditingSeqFx(null);
                             document.removeEventListener('mousemove', handleMouseMove);
                             document.removeEventListener('mouseup', handleMouseUp);
                           };
-                          
+
                           document.addEventListener('mousemove', handleMouseMove);
                           document.addEventListener('mouseup', handleMouseUp);
                         }}
                       >
-                        <SequencerFxKnobSVG value={knobValue} isDragging={isEditing} />
+                        <SequencerFxKnobSVG
+                          value={knobValue}
+                          isDragging={isEditing}
+                          accentColor={isDrive ? '#FF9500' : undefined}
+                        />
                       </div>
                       <div
                         style={{
                           fontSize: '7px',
-                          color: '#888',
+                          color: isDrive ? '#FF9500' : '#888',
                           textAlign: 'center',
                           marginTop: '4px',
                           textTransform: 'uppercase',
                           cursor: 'move',
+                          ...(isDrive ? { fontWeight: 'bold' } : {}),
                         }}
                         draggable={true}
                         onDragStart={(e) => {
@@ -3349,7 +3416,6 @@ export default function TestSynth() {
                           e.dataTransfer.effectAllowed = 'move';
                         }}
                         onDragEnd={(e) => {
-                          // If drag ended without successful drop, remove the slot
                           if (!isSeqFxDropSuccessful.current) {
                             setSeqFxSlots(prev => {
                               const next = [...prev];
@@ -3365,10 +3431,10 @@ export default function TestSynth() {
                           setDraggingSeqFx(null);
                           isSeqFxDropSuccessful.current = false;
                         }}
-                        onMouseEnter={(e) => { e.currentTarget.style.color = '#fff'; }}
-                        onMouseLeave={(e) => { e.currentTarget.style.color = '#888'; }}
+                        onMouseEnter={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#fff'; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.color = isDrive ? '#FF9500' : '#888'; }}
                       >
-                        {assignedFx}
+                        {isDrive ? 'DRIVE' : assignedFx}
                       </div>
                     </div>
                   );
@@ -3416,12 +3482,10 @@ export default function TestSynth() {
                         setSeqFxValues(prev => {
                           const next = [...prev];
                           if (existingIndex !== -1 && existingIndex !== index) {
-                            // Move value from old slot
                             next[index] = existingValue;
                             next[existingIndex] = 0.5;
                           } else {
-                            // New effect, default value
-                            next[index] = 0.5;
+                            next[index] = paramName === 'Drive' ? seqDistortion / 100 : 0.5;
                           }
                           return next;
                         });
@@ -3452,6 +3516,47 @@ export default function TestSynth() {
               })}
             </div>
           </div>
+        </div>
+
+        {/* Key, Scale, Presets & Dice */}
+        <div style={{ display: 'flex', gap: '10px', marginBottom: '15px', alignItems: 'center' }}>
+          <select
+            value={seqRootKey}
+            onChange={(e) => setSeqRootKey(e.target.value)}
+            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
+          >
+            {NOTE_NAMES.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+          <select
+            value={seqScale}
+            onChange={(e) => setSeqScale(e.target.value)}
+            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
+          >
+            <option value="Major">Major</option>
+            <option value="Minor">Minor</option>
+          </select>
+          <select
+            onChange={(e) => {
+              if (e.target.value) injectSequencePattern(SEQ_PRESETS[e.target.value]);
+              e.target.value = '';
+            }}
+            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
+          >
+            <option value="">-- Load Preset --</option>
+            {Object.keys(SEQ_PRESETS).map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={injectRandomSequence}
+            style={{ background: '#333', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', padding: '2px 8px' }}
+            title="Random pattern"
+          >
+            🎲
+          </button>
         </div>
 
         {/* Section D: Step Grid (Rail + Rhythm Guide) */}

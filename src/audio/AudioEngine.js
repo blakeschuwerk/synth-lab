@@ -3,6 +3,10 @@ import WebAudioRenderer from '@elemaudio/web-renderer';
 
 const core = new WebAudioRenderer();
 
+if (typeof window !== 'undefined') {
+  window.activeAudioFilters = [];
+}
+
 function makeDistortionCurve(amount) {
   const k = typeof amount === 'number' ? amount : 50;
   const n_samples = 44100;
@@ -50,6 +54,9 @@ class SynthVoice {
     this.filterNode = ctx.createBiquadFilter();
     this.filterNode.type = 'lowpass';
     this.filterNode.frequency.value = cutoffToHz(currentCutoffNorm);
+    if (typeof window !== 'undefined' && window.activeAudioFilters) {
+      window.activeAudioFilters.push({ id: 'Main Synth Voice', type: this.filterNode.type, freq: this.filterNode.frequency.value });
+    }
 
     const type = waveform === 'saw' ? 'sawtooth' : waveform;
     this.osc.type = type;
@@ -298,24 +305,26 @@ export function triggerSequencerStep(noteName, time, params = {}, isTiedFromPrev
   const sLevel = sustain / 100;
   const rTime = Math.max(MIN_TIME, (release / 100) * stepDuration);
 
-  // Create nodes: osc -> filter -> env -> destination
+  // Direct path: oscillator -> envelope (gain) -> seqFxInput. No hidden filter; filtering only via modular Cutoff in FX rack.
   const osc = ctx.createOscillator();
-  const filter = ctx.createBiquadFilter();
   const env = ctx.createGain();
 
-  // Configure oscillator
-  osc.type = wave === 'saw' ? 'sawtooth' : wave === 'square' ? 'square' : wave;
+  const type = wave === 'saw' ? 'sawtooth' : wave;
+  osc.type = type;
   osc.frequency.value = frequency;
 
-  // Configure filter
-  filter.type = 'lowpass';
-  filter.frequency.value = cutoffToHz(cutoff);
-  filter.Q.value = res;
+  const runBypassDiagnostic = false;
+  if (runBypassDiagnostic) {
+    env.connect(seqVolumeNode || mixerNode);
+  } else {
+    env.connect(seqFxInput || mixerNode);
+  }
 
-  // Connect: osc -> filter -> env -> seqFxInput (sequencer FX bus)
-  osc.connect(filter);
-  filter.connect(env);
-  env.connect(seqFxInput || mixerNode); // Fallback to mixerNode if bus not initialized
+  osc.connect(env);
+
+  if (typeof window !== 'undefined' && window.activeAudioFilters) {
+    console.log('🕵️ FORENSIC FIILTER REPORT:', window.activeAudioFilters);
+  }
 
   // Live parameter dump / wiretap for Debug UI
   if (debugCallback) {
@@ -351,11 +360,9 @@ export function triggerSequencerStep(noteName, time, params = {}, isTiedFromPrev
     osc.stop(time + gateLength + rTime + 0.1);
   }
 
-  // Cleanup after note ends
   osc.onended = () => {
     try {
       osc.disconnect();
-      filter.disconnect();
       env.disconnect();
     } catch (_) {}
   };
@@ -394,12 +401,12 @@ export function updateSeqEffectsChain(slots, values) {
       const effectName = slots[i];
 
       if (effectName === 'Cutoff') {
-        // Create a lowpass filter
         const filter = ctx.createBiquadFilter();
         filter.type = 'lowpass';
-        
-        // Set Q/resonance (optional, could be controlled by another effect)
         filter.Q.value = 1.0;
+        if (typeof window !== 'undefined' && window.activeAudioFilters) {
+          window.activeAudioFilters.push({ id: 'Modular Cutoff', type: filter.type, freq: filter.frequency.value });
+        }
 
         // Connect current node to this filter
         currentNode.connect(filter);
