@@ -1,0 +1,10 @@
+.synth-dropdown-item {
+  background-color: transparent;
+  color: #ffffff;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.synth-dropdown-item:hover {
+  background-color: #00e5ff !important;
+  color: #000000 !important;
+}

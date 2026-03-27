@@ -91,6 +91,12 @@ const SEQ_PRESETS = {
   'Pedal Point': [1, 5, 1, 6, 1, 7, 1, 8, 1, 7, 1, 6, 1, 5, 1, 4],
 };
 
+const GENERATIVE_PRESETS = ['Ascending', 'Up & Down', 'Broken Chords', 'Octave Bounce', 'Pedal Point'];
+
+const NOTE_ORDERS = ['Up', 'Down', 'Up & Down', 'Outside-In', 'Random'];
+const SEQ_RATES = ['1/4', '1/8', '1/8 Triplet', '1/16', '1/16 Triplet', '1/32'];
+const OCTAVE_RANGES = [1, 2, 3, 4];
+
 const DiagnosticProbe = ({ audioPlaying, analyzer, width, height }) => (
   <div style={{
     position: 'absolute',
@@ -331,6 +337,10 @@ export default function TestSynth() {
   const [currentStep, setCurrentStep] = useState(-1); // -1 = stopped, 0-15 = current step
   const [isRecording, setIsRecording] = useState(false);
   const [recordingIndex, setRecordingIndex] = useState(0);
+  const [selectedSeqSteps, setSelectedSeqSteps] = useState([]);
+  const selectedSeqStepsRef = useRef([]);
+  const [isDragSelecting, setIsDragSelecting] = useState(false);
+  const [isShiftHeld, setIsShiftHeld] = useState(false);
   const [clearButtonHover, setClearButtonHover] = useState(false);
   // Sequencer Voice parameters
   const [seqWave, setSeqWave] = useState('saw'); // 'saw' | 'square'
@@ -348,6 +358,12 @@ export default function TestSynth() {
   const [seqDistortion, setSeqDistortion] = useState(0);
   const [seqRootKey, setSeqRootKey] = useState('C');
   const [seqScale, setSeqScale] = useState('Major');
+  const [isSeqKeyMenuOpen, setIsSeqKeyMenuOpen] = useState(false);
+  const [isPresetMenuOpen, setIsPresetMenuOpen] = useState(false);
+  const [activeFlyout, setActiveFlyout] = useState(null); // 'order', 'rate', 'range', or null
+  const [noteOrder, setNoteOrder] = useState('Random');
+  const [seqRate, setSeqRate] = useState('1/16');
+  const [octaveSpan, setOctaveSpan] = useState(1);
   const audioInitialized = useRef(false);
   const analyserRef = useRef(null);
   const visorDisplayRef = useRef(null);
@@ -361,6 +377,7 @@ export default function TestSynth() {
   const seqEngineRef = useRef({
     bpm: 120,
     steps: [],
+    seqRate: '1/16',
     currentStep: 0,
     nextNoteTime: 0,
     seqWave: 'saw',
@@ -385,6 +402,57 @@ export default function TestSynth() {
     updateSynthDistortion(synthDistortion);
     updateSeqDistortion(seqDistortion);
   }, [synthDistortion, seqDistortion]);
+
+  useEffect(() => {
+    selectedSeqStepsRef.current = selectedSeqSteps;
+  }, [selectedSeqSteps]);
+
+  useEffect(() => {
+    const handleKeyDown = (e) => { if (e.key === 'Shift') setIsShiftHeld(true); };
+    const handleKeyUp = (e) => { if (e.key === 'Shift') setIsShiftHeld(false); };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleGlobalMouseDown = (e) => {
+      if (!e.target.closest('[data-seq-key-menu="true"]')) {
+        setIsSeqKeyMenuOpen(false);
+      }
+      if (!e.target.closest('[data-preset-menu="true"]')) {
+        setIsPresetMenuOpen(false);
+        setActiveFlyout(null);
+      }
+      // 1. If Shift is held ANYWHERE on screen, arm the paintbrush
+      if (e.shiftKey || e.metaKey) {
+        setIsDragSelecting(true);
+        return;
+      }
+
+      // 2. If Shift is NOT held, and they didn't click a step, drop the selection
+      if (e.target.closest('[data-seq-step="true"]')) return;
+      if (e.target.closest('[data-seq-key-menu="true"]')) return;
+      if (e.target.closest('[data-preset-menu="true"]')) return;
+      setSelectedSeqSteps([]);
+    };
+
+    const handleGlobalMouseUp = () => {
+      // 3. Disarm the paintbrush the moment they let go of the mouse anywhere
+      setIsDragSelecting(false);
+    };
+
+    window.addEventListener('mousedown', handleGlobalMouseDown);
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+
+    return () => {
+      window.removeEventListener('mousedown', handleGlobalMouseDown);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, []);
 
   // Update filter diagnostic in real-time when Debug Panel is open (for Cutoff knob verification)
   useEffect(() => {
@@ -630,6 +698,20 @@ export default function TestSynth() {
         setModulation(Math.min(127, modValue));
         return;
       }
+      if (e.key === '=' || e.key === '+') {
+        e.preventDefault();
+        shiftSequencerOctave(1);
+        return;
+      }
+      if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        shiftSequencerOctave(-1);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setSelectedSeqSteps([]);
+        return;
+      }
 
       // Piano keys
       if (KEY_TO_NOTE[key] && !pressedKeys.has(key)) {
@@ -736,6 +818,28 @@ export default function TestSynth() {
     }
   }, [waveform, velocity, activeNotes]);
 
+  const calculateStepDuration = (bpmValue, rate) => {
+    // A standard beat in milliseconds (1 quarter note)
+    const quarterNoteMs = 60000 / bpmValue;
+
+    switch (rate) {
+      case '1/4':
+        return quarterNoteMs;
+      case '1/8':
+        return quarterNoteMs / 2;
+      case '1/8 Triplet':
+        return quarterNoteMs / 3; // 3 notes fit into one quarter note
+      case '1/16':
+        return quarterNoteMs / 4;
+      case '1/16 Triplet':
+        return quarterNoteMs / 6; // 6 notes fit into one quarter note
+      case '1/32':
+        return quarterNoteMs / 8;
+      default:
+        return quarterNoteMs / 4; // Default to 1/16
+    }
+  };
+
   // Lookahead Scheduler: Master Clock for Sequencer Playback (reads from seqEngineRef to avoid restarts on BPM/step change)
   useEffect(() => {
     if (!isPlaying || !audioInitialized.current || !window.globalAudioContext) {
@@ -752,8 +856,8 @@ export default function TestSynth() {
     const schedule = () => {
       const steps = seqEngineRef.current.steps;
       const bpm = seqEngineRef.current.bpm;
-      const secondsPerBeat = 60.0 / bpm;
-      const stepDuration = secondsPerBeat / 4;
+      const rate = seqEngineRef.current.seqRate;
+      const stepDuration = calculateStepDuration(bpm, rate) / 1000;
 
       while (seqEngineRef.current.nextNoteTime < ctx.currentTime + 0.1) {
         const loopLength = calculateLoopLength(steps);
@@ -825,9 +929,130 @@ export default function TestSynth() {
     );
   };
 
+  const applyNoteOrderMath = (rawNotes, orderSelection) => {
+    if (orderSelection === 'Random') {
+      const shuffled = [...rawNotes];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      return shuffled;
+    }
+
+    // Base sort: lowest pitch to highest
+    const sortedUp = [...rawNotes].sort((a, b) => a.pitchValue - b.pitchValue);
+
+    if (orderSelection === 'Up') return sortedUp;
+    if (orderSelection === 'Down') return [...sortedUp].reverse();
+
+    if (orderSelection === 'Up & Down') {
+      const upSide = [];
+      const downSide = [];
+
+      // Deal the sorted notes out back-and-forth to build a perfect mountain
+      sortedUp.forEach((note, index) => {
+        if (index % 2 === 0) {
+          upSide.push(note);
+        } else {
+          downSide.push(note);
+        }
+      });
+
+      // Reverse the downSide so it descends, and stitch them together
+      return [...upSide, ...downSide.reverse()];
+    }
+
+    if (orderSelection === 'Outside-In') {
+      const outsideIn = [];
+      let left = 0;
+      let right = sortedUp.length - 1;
+      while (left <= right) {
+        if (left === right) {
+          outsideIn.push(sortedUp[left]);
+        } else {
+          outsideIn.push(sortedUp[right]); // Highest available
+          outsideIn.push(sortedUp[left]); // Lowest available
+        }
+        left++;
+        right--;
+      }
+      return outsideIn.slice(0, rawNotes.length);
+    }
+
+    return rawNotes;
+  };
+
   const injectRandomSequence = () => {
-    const randomPattern = Array.from({ length: 16 }, () => Math.floor(Math.random() * 8) + 1);
-    injectSequencePattern(randomPattern);
+    // Build a massive pool of valid notes across multiple octaves
+    let expandedNotePool = [];
+    const baseOctave = 3;
+    const rootIndex = NOTE_NAMES.indexOf(seqRootKey);
+    const scaleIntervals = SCALES[seqScale] || SCALES.Major;
+
+    for (let i = 0; i < octaveSpan; i++) {
+      const currentOctave = baseOctave + i;
+      const octaveNotes = scaleIntervals
+        .map((semitones) => {
+          const absoluteIndex = rootIndex + semitones;
+          const noteName = NOTE_NAMES[((absoluteIndex % 12) + 12) % 12];
+          const octaveOffset = Math.floor(absoluteIndex / 12);
+          const note = `${noteName}${currentOctave + octaveOffset}`;
+          const pitchValue = noteStringToFrequency(note);
+          if (!note || pitchValue == null) return null;
+          return { note, pitchValue };
+        })
+        .filter(Boolean);
+
+      expandedNotePool = [...expandedNotePool, ...octaveNotes];
+    }
+
+    if (expandedNotePool.length === 0) return;
+
+    const rawRandomNotes = [];
+    for (let i = 0; i < 16; i++) {
+      const randomIdx = Math.floor(Math.random() * expandedNotePool.length);
+      rawRandomNotes.push(expandedNotePool[randomIdx]);
+    }
+
+    const orderedNotes = applyNoteOrderMath(rawRandomNotes, noteOrder);
+
+    setSequencerSteps((prevSteps) =>
+      prevSteps.map((step, i) => {
+        const selected = orderedNotes[i % orderedNotes.length];
+        return {
+          ...step,
+          note: selected ? selected.note : null,
+          active: !!selected,
+          tied: false,
+        };
+      })
+    );
+  };
+
+  const handleSeqKeySelect = (combinedString) => {
+    const [newKey, newScale] = combinedString.split(' ');
+    setSeqRootKey(newKey);
+    setSeqScale(newScale);
+    setIsSeqKeyMenuOpen(false);
+  };
+
+  const shiftSequencerOctave = (direction) => {
+    setSequencerSteps((prevSteps) =>
+      prevSteps.map((step, i) => {
+        if (!step.note) return step;
+        if (selectedSeqStepsRef.current.length > 0 && !selectedSeqStepsRef.current.includes(i)) return step;
+        const match = step.note.match(/^([A-Z]#?)(\d+)$/);
+        if (!match) return step;
+        const noteName = match[1];
+        const currentOctave = parseInt(match[2], 10);
+        let newOctave = currentOctave + direction;
+        newOctave = Math.max(1, Math.min(newOctave, 7));
+        return {
+          ...step,
+          note: `${noteName}${newOctave}`,
+        };
+      })
+    );
   };
 
   const sequencerStepsRef = useRef(sequencerSteps);
@@ -842,10 +1067,11 @@ export default function TestSynth() {
   useEffect(() => {
     seqEngineRef.current.bpm = bpm;
     seqEngineRef.current.steps = sequencerSteps;
+    seqEngineRef.current.seqRate = seqRate;
     seqEngineRef.current.seqWave = seqWave;
     seqEngineRef.current.seqCutoff = seqCutoff;
     seqEngineRef.current.seqRes = seqRes;
-  }, [bpm, sequencerSteps, seqWave, seqCutoff, seqRes]);
+  }, [bpm, sequencerSteps, seqRate, seqWave, seqCutoff, seqRes]);
 
   // Update sequencer FX chain when slots or values change
   useEffect(() => {
@@ -2024,7 +2250,7 @@ export default function TestSynth() {
   };
 
   return (
-    <React.Fragment>
+    <div style={{ cursor: isShiftHeld ? 'crosshair' : 'default' }}>
       <style dangerouslySetInnerHTML={{ __html: `@keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.9; } } body, #root { user-select: none; -webkit-user-select: none; }
 .mixer-spine { width: 70px; min-width: 70px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; border: 2px solid #333; border-radius: 8px; padding: 15px 0; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); flex-shrink: 0; }
 .mixer-header { color: #888; font-size: 10px; font-weight: bold; letter-spacing: 1px; margin-bottom: 15px; }
@@ -2035,6 +2261,10 @@ export default function TestSynth() {
 .vertical-fader::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 8px; background: #555; border-radius: 2px; cursor: pointer; }
 .synth-fader::-webkit-slider-thumb { border: 1px solid #4a90e2; box-shadow: 0 0 5px #4a90e2; }
 .seq-fader::-webkit-slider-thumb { border: 1px solid #00FFFF; box-shadow: 0 0 5px #00FFFF; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #222; }
+::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #777; }
 ` }} />
       {/* Drawer Overlay */}
       {libraryOpen && (
@@ -3184,71 +3414,8 @@ export default function TestSynth() {
 
       {/* Sequencer Sidecar */}
       <div style={styles.sequencerSidecar}>
-        {/* Master LCD (Transport, BPM, Waveform) */}
+        {/* Master LCD (BPM + Waveform only; transport moved to Control Bar above step grid) */}
         <div style={styles.sequencerMasterLCD}>
-          <button
-            type="button"
-            style={{
-              ...styles.sequencerLCDPlayStatus,
-              color: isPlaying ? '#0f0' : '#f00',
-              ...(isPlaying ? { textShadow: '0 0 5px rgba(0, 255, 0, 0.6)' } : {}),
-            }}
-            onClick={() => setIsPlaying(!isPlaying)}
-            title={isPlaying ? 'Stop' : 'Play'}
-          >
-            {isPlaying ? 'RUN' : 'STOP'}
-          </button>
-          <button
-            type="button"
-            style={{
-              ...styles.sequencerRecButton,
-              ...(isRecording ? styles.sequencerRecButtonActive : {}),
-            }}
-            onClick={() => {
-              const next = !isRecording;
-              setIsRecording(next);
-              if (next) setRecordingIndex(0); // start at step 1 when turning record on
-            }}
-            title={isRecording ? 'Stop recording' : 'Record steps'}
-            >
-            RECORD
-          </button>
-          {isRecording && (
-            <button
-              type="button"
-              style={styles.sequencerRestButton}
-              onClick={() => {
-                setSequencerSteps(prev => {
-                  const next = prev.map((step, i) =>
-                    i === recordingIndex ? { active: false, tied: false, note: null } : step
-                  );
-                  return next;
-                });
-                setRecordingIndex(prev => (prev + 1) % 16);
-              }}
-              title="Insert rest (silence) and advance"
-            >
-              REST
-            </button>
-          )}
-          <button
-            type="button"
-            style={{
-              ...styles.sequencerClearButton,
-              ...(clearButtonHover ? { background: '#522', color: '#f88', borderColor: '#833' } : {}),
-            }}
-            onMouseEnter={() => setClearButtonHover(true)}
-            onMouseLeave={() => setClearButtonHover(false)}
-            onClick={() => {
-              setSequencerSteps(() =>
-                Array.from({ length: 16 }, () => ({ active: false, tied: false, note: null }))
-              );
-              setRecordingIndex(0);
-            }}
-            title="Clear all steps"
-          >
-            CLEAR
-          </button>
           <input
             type="number"
             value={bpm}
@@ -3520,35 +3687,258 @@ export default function TestSynth() {
 
         {/* Key, Scale, Presets & Dice */}
         <div style={{ display: 'flex', gap: '10px', marginBottom: '15px', alignItems: 'center' }}>
-          <select
-            value={seqRootKey}
-            onChange={(e) => setSeqRootKey(e.target.value)}
-            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
-          >
-            {NOTE_NAMES.map((n) => (
-              <option key={n} value={n}>{n}</option>
-            ))}
-          </select>
-          <select
-            value={seqScale}
-            onChange={(e) => setSeqScale(e.target.value)}
-            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
-          >
-            <option value="Major">Major</option>
-            <option value="Minor">Minor</option>
-          </select>
-          <select
-            onChange={(e) => {
-              if (e.target.value) injectSequencePattern(SEQ_PRESETS[e.target.value]);
-              e.target.value = '';
-            }}
-            style={{ background: '#222', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
-          >
-            <option value="">-- Load Preset --</option>
-            {Object.keys(SEQ_PRESETS).map((p) => (
-              <option key={p} value={p}>{p}</option>
-            ))}
-          </select>
+          <div style={{ position: 'relative' }} data-seq-key-menu="true">
+            <button
+              type="button"
+              onClick={() => setIsSeqKeyMenuOpen(true)}
+              style={{
+                background: '#222',
+                color: '#fff',
+                border: '1px solid #444',
+                borderRadius: '4px',
+                padding: '6px 10px',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: '12px',
+                minWidth: '120px',
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+                gap: '6px',
+              }}
+              title="Sequencer Key + Scale"
+            >
+              {seqRootKey} {seqScale}
+            </button>
+
+            {isSeqKeyMenuOpen && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 'calc(100% + 6px)',
+                  left: 0,
+                  zIndex: 9999,
+                  background: '#111',
+                  border: '1px solid #444',
+                  borderRadius: '6px',
+                  padding: '6px 0',
+                  boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+                  width: '170px',
+                  maxHeight: '260px',
+                  overflowY: 'auto',
+                }}
+              >
+                {[...NOTE_NAMES.map((n) => `${n} Major`), ...NOTE_NAMES.map((n) => `${n} Minor`)].map((opt) => {
+                  const selected = opt === `${seqRootKey} ${seqScale}`;
+                  return (
+                    <div
+                      key={opt}
+                      onClick={() => handleSeqKeySelect(opt)}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = selected ? 'rgba(0, 240, 255, 0.28)' : 'rgba(255,255,255,0.06)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = selected ? 'rgba(0, 240, 255, 0.18)' : 'transparent';
+                      }}
+                      style={{
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        color: '#fff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        background: selected ? 'rgba(0, 240, 255, 0.18)' : 'transparent',
+                      }}
+                    >
+                      <span style={{ fontSize: '12px' }}>{opt}</span>
+                      {selected && <span style={{ color: '#00f0ff', fontWeight: 'bold' }}>✓</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <div style={{ position: 'relative' }} data-preset-menu="true" onMouseLeave={() => setActiveFlyout(null)}>
+            {/* The Trigger Button */}
+            <button
+              onClick={() => setIsPresetMenuOpen(!isPresetMenuOpen)}
+              style={{
+                background: '#333',
+                color: '#fff',
+                border: '1px solid #555',
+                padding: '4px 10px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                minWidth: '140px',
+                justifyContent: 'space-between',
+                fontSize: '12px',
+              }}
+            >
+              <span>Default Preset</span>
+              <span style={{ fontSize: '10px' }}>▼</span>
+            </button>
+
+            {/* The Main Menu (Shoots UP from the button) */}
+            {isPresetMenuOpen && (
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: '100%',
+                  right: 0,
+                  marginBottom: '4px',
+                  background: '#222',
+                  border: '1px solid #444',
+                  borderRadius: '4px',
+                  width: '160px',
+                  zIndex: 100,
+                  boxShadow: '0 -4px 12px rgba(0,0,0,0.5)',
+                  padding: '4px 0',
+                  fontSize: '12px',
+                }}
+              >
+                {/* Parameter Categories */}
+                <div
+                  onMouseEnter={() => setActiveFlyout('order')}
+                  style={{
+                    padding: '4px 10px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    background: activeFlyout === 'order' ? '#00e5ff' : 'transparent',
+                    color: activeFlyout === 'order' ? '#000' : '#fff',
+                  }}
+                >
+                  <span>Note Order</span>
+                  <span>‹</span>
+                </div>
+
+                <div
+                  onMouseEnter={() => setActiveFlyout('rate')}
+                  style={{
+                    padding: '4px 10px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    background: activeFlyout === 'rate' ? '#00e5ff' : 'transparent',
+                    color: activeFlyout === 'rate' ? '#000' : '#fff',
+                  }}
+                >
+                  <span>Rate</span>
+                  <span>‹</span>
+                </div>
+
+                <div
+                  onMouseEnter={() => setActiveFlyout('range')}
+                  style={{
+                    padding: '4px 10px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    background: activeFlyout === 'range' ? '#00e5ff' : 'transparent',
+                    color: activeFlyout === 'range' ? '#000' : '#fff',
+                  }}
+                >
+                  <span>Octave Range</span>
+                  <span>‹</span>
+                </div>
+
+                <div style={{ height: '1px', background: '#444', margin: '4px 0' }}></div>
+
+                {/* Actual Presets */}
+                <div style={{ maxHeight: '120px', overflowY: 'auto' }}>
+                  {GENERATIVE_PRESETS.map((preset) => (
+                    <div
+                      key={preset}
+                      className="synth-dropdown-item"
+                      onMouseEnter={() => setActiveFlyout(null)}
+                      onClick={() => {
+                        // Load preset degrees into sequencer (presets drive note selection via getNoteFromDegree()).
+                        const degrees = SEQ_PRESETS[preset];
+                        if (degrees) injectSequencePattern(degrees);
+                        setIsPresetMenuOpen(false);
+                        setActiveFlyout(null);
+                      }}
+                      style={{ padding: '4px 10px', cursor: 'pointer' }}
+                    >
+                      {preset}
+                    </div>
+                  ))}
+                </div>
+
+                {/* The Cascading Flyout Menu (Shoots LEFT from the main menu) */}
+                {activeFlyout && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      right: '100%',
+                      marginRight: '2px',
+                      background: '#222',
+                      border: '1px solid #444',
+                      borderRadius: '4px',
+                      width: '130px',
+                      boxShadow: '-4px 4px 12px rgba(0,0,0,0.5)',
+                      padding: '4px 0',
+                      fontSize: '12px',
+                      maxHeight: '180px',
+                      overflowY: 'auto',
+                    }}
+                  >
+                    {activeFlyout === 'order' &&
+                      NOTE_ORDERS.map((order) => (
+                        <div
+                          key={order}
+                          className="synth-dropdown-item"
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            setNoteOrder(order); 
+                          }}
+                          style={{ padding: '4px 10px', cursor: 'pointer', display: 'flex', gap: '6px' }}
+                        >
+                          <span style={{ width: '10px' }}>{noteOrder === order ? '✓' : ''}</span>
+                          {order}
+                        </div>
+                      ))}
+
+                    {activeFlyout === 'rate' &&
+                      SEQ_RATES.map((rate) => (
+                        <div
+                          key={rate}
+                          className="synth-dropdown-item"
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            setSeqRate(rate); 
+                          }}
+                          style={{ padding: '4px 10px', cursor: 'pointer', display: 'flex', gap: '6px' }}
+                        >
+                          <span style={{ width: '10px' }}>{seqRate === rate ? '✓' : ''}</span>
+                          {rate}
+                        </div>
+                      ))}
+
+                    {activeFlyout === 'range' &&
+                      OCTAVE_RANGES.map((range) => (
+                        <div
+                          key={range}
+                          className="synth-dropdown-item"
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            setOctaveSpan(range); 
+                          }}
+                          style={{ padding: '4px 10px', cursor: 'pointer', display: 'flex', gap: '6px' }}
+                        >
+                          <span style={{ width: '10px' }}>{octaveSpan === range ? '✓' : ''}</span>
+                          {range}
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           <button
             type="button"
             onClick={injectRandomSequence}
@@ -3559,9 +3949,96 @@ export default function TestSynth() {
           </button>
         </div>
 
+        {/* Control Bar: Transport (left) + Octave Shift (right), directly above step grid */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: '10px' }}>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              type="button"
+              style={{
+                ...styles.sequencerLCDPlayStatus,
+                color: isPlaying ? '#0f0' : '#f00',
+                ...(isPlaying ? { textShadow: '0 0 5px rgba(0, 255, 0, 0.6)' } : {}),
+              }}
+              onClick={() => setIsPlaying(!isPlaying)}
+              title={isPlaying ? 'Stop' : 'Play'}
+            >
+              {isPlaying ? 'RUN' : 'STOP'}
+            </button>
+            <button
+              type="button"
+              style={{
+                ...styles.sequencerRecButton,
+                ...(isRecording ? styles.sequencerRecButtonActive : {}),
+              }}
+              onClick={() => {
+                const next = !isRecording;
+                setIsRecording(next);
+                if (next) setRecordingIndex(0);
+              }}
+              title={isRecording ? 'Stop recording' : 'Record steps'}
+            >
+              RECORD
+            </button>
+            {isRecording && (
+              <button
+                type="button"
+                style={styles.sequencerRestButton}
+                onClick={() => {
+                  setSequencerSteps(prev => {
+                    const next = prev.map((step, i) =>
+                      i === recordingIndex ? { active: false, tied: false, note: null } : step
+                    );
+                    return next;
+                  });
+                  setRecordingIndex(prev => (prev + 1) % 16);
+                }}
+                title="Insert rest (silence) and advance"
+              >
+                REST
+              </button>
+            )}
+            <button
+              type="button"
+              style={{
+                ...styles.sequencerClearButton,
+                ...(clearButtonHover ? { background: '#522', color: '#f88', borderColor: '#833' } : {}),
+              }}
+              onMouseEnter={() => setClearButtonHover(true)}
+              onMouseLeave={() => setClearButtonHover(false)}
+              onClick={() => {
+                setSequencerSteps(() =>
+                  Array.from({ length: 16 }, () => ({ active: false, tied: false, note: null }))
+                );
+                setRecordingIndex(0);
+              }}
+              title="Clear all steps"
+            >
+              CLEAR
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '5px' }}>
+            <button
+              type="button"
+              onClick={() => shiftSequencerOctave(-1)}
+              style={{ background: '#333', color: '#fff', border: '1px solid #555', borderRadius: '4px', width: '30px', height: '30px', display: 'flex', justifyContent: 'center', alignItems: 'center', cursor: 'pointer', fontWeight: 'bold' }}
+              title="Shift sequencer notes down one octave"
+            >
+              -
+            </button>
+            <button
+              type="button"
+              onClick={() => shiftSequencerOctave(1)}
+              style={{ background: '#333', color: '#fff', border: '1px solid #555', borderRadius: '4px', width: '30px', height: '30px', display: 'flex', justifyContent: 'center', alignItems: 'center', cursor: 'pointer', fontWeight: 'bold' }}
+              title="Shift sequencer notes up one octave"
+            >
+              +
+            </button>
+          </div>
+        </div>
+
         {/* Section D: Step Grid (Rail + Rhythm Guide) */}
         <div style={styles.sequencerStepRail}>
-          <div style={styles.sequencerStepsGrid}>
+          <div style={{ ...styles.sequencerStepsGrid, cursor: isShiftHeld ? 'crosshair' : 'default' }}>
           {sequencerSteps.map((step, index) => {
             const isActive = step && step.active;
             const isTied = step && step.tied;
@@ -3571,6 +4048,7 @@ export default function TestSynth() {
               <button
                 key={index}
                 type="button"
+                data-seq-step="true"
                 style={{
                   ...styles.sequencerStepButton,
                   ...(!isActive && isDownbeat ? styles.sequencerStepButtonDownbeat : {}),
@@ -3578,31 +4056,56 @@ export default function TestSynth() {
                   ...(isActive && isTied ? styles.sequencerStepButtonTied : {}),
                   ...(currentStep === index ? styles.sequencerStepButtonCurrent : {}),
                   ...(isRecordingCursor ? styles.sequencerStepButtonRecordingCursor : {}),
+                  backgroundColor: isActive ? (isTied ? '#ffcc00' : '#ff8800') : '#444',
+                  cursor: isShiftHeld ? 'crosshair' : (step.note ? 'pointer' : 'default'),
+                  outline: selectedSeqSteps.includes(index) ? '1px solid rgba(0, 229, 255, 0.5)' : 'none',
+                  outlineOffset: '2px',
                 }}
-                onClick={() => {
-                  if (isRecording) {
-                    setRecordingIndex(index); // click-to-set cursor
-                    return;
+                onClick={(e) => {
+                  if (!step.note) return;
+                  if (!isShiftHeld) {
+                    let nextIsActive = false;
+                    let nextIsTied = false;
+
+                    if (!isActive) {
+                      nextIsActive = true;
+                      nextIsTied = false;
+                    } else if (isActive && !isTied) {
+                      nextIsActive = true;
+                      nextIsTied = true;
+                    } else {
+                      nextIsActive = false;
+                      nextIsTied = false;
+                    }
+
+                    if (selectedSeqSteps.length > 0 && selectedSeqSteps.includes(index)) {
+                      setSequencerSteps((prev) => prev.map((s, i) =>
+                        selectedSeqSteps.includes(i)
+                          ? { ...s, active: nextIsActive, tied: nextIsTied, isActive: nextIsActive, isTied: nextIsTied }
+                          : s
+                      ));
+                    } else {
+                      setSelectedSeqSteps([]);
+                      setSequencerSteps((prev) => prev.map((s, i) =>
+                        i === index
+                          ? { ...s, active: nextIsActive, tied: nextIsTied, isActive: nextIsActive, isTied: nextIsTied }
+                          : s
+                      ));
+                    }
                   }
-                  // Multi-Click Tie Workflow: Cycle through 3 states
-                  // State A (Empty): !active -> active: true, tied: false
-                  // State B (Standard): active && !tied -> active: true, tied: true
-                  // State C (Tied): active && tied -> active: false, tied: false
-                  setSequencerSteps(prev =>
-                    prev.map((s, i) => {
-                      if (i !== index) return s;
-                      if (!s.active) {
-                        // State A -> State B
-                        return { active: true, tied: false, note: s.note };
-                      } else if (s.active && !s.tied) {
-                        // State B -> State C
-                        return { active: true, tied: true, note: s.note };
-                      } else {
-                        // State C -> State A
-                        return { active: false, tied: false, note: null };
-                      }
-                    })
-                  );
+                }}
+                onMouseDown={(e) => {
+                  if (!step.note) return;
+                  if (isShiftHeld) {
+                    setIsDragSelecting(true);
+                    setSelectedSeqSteps((prev) => prev.includes(index) ? prev.filter((idx) => idx !== index) : [...prev, index]);
+                  }
+                }}
+                onMouseEnter={() => {
+                  if (!step.note) return;
+                  if (isDragSelecting) {
+                    setSelectedSeqSteps((prev) => prev.includes(index) ? prev : [...prev, index]);
+                  }
                 }}
                 title={step.note ? `Step ${index + 1}: ${step.note}` : `Step ${index + 1}`}
               >
@@ -3680,6 +4183,6 @@ export default function TestSynth() {
       {isExpanded && analyserRef.current && (
         <SpectrumLab analyzer={analyserRef.current} />
       )}
-    </React.Fragment>
+    </div>
   );
 }
